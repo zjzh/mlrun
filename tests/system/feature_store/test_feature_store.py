@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from time import sleep
 
 import fsspec
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import pytest
@@ -16,6 +17,7 @@ from storey import MapClass
 import mlrun
 import mlrun.feature_store as fs
 import tests.conftest
+from mlrun.config import config
 from mlrun.data_types.data_types import ValueType
 from mlrun.datastore.sources import (
     CSVSource,
@@ -170,6 +172,10 @@ class TestFeatureStore(TestMLRunSystem):
             assert False
         except mlrun.errors.MLRunInvalidArgumentError:
             pass
+
+        # check passing a list of list (of entity values) works
+        resp = svc.get([["GOOG"]])
+        assert resp[0]["name"] == "Alphabet Inc", "unexpected online result"
 
         resp = svc.get([{"ticker": "a"}])
         assert resp[0] is None
@@ -338,6 +344,26 @@ class TestFeatureStore(TestMLRunSystem):
         vecs = db.list_feature_vectors(self.project_name, name)
         assert not vecs, "Feature vector should be deleted"
 
+    def test_top_value_of_boolean_column(self):
+        stocks = pd.DataFrame(
+            {
+                "ticker": ["MSFT", "GOOG", "AAPL"],
+                "name": ["Microsoft Corporation", "Alphabet Inc", "Apple Inc"],
+                "booly": [True, False, True],
+            }
+        )
+        stocks_set = fs.FeatureSet(
+            "stocks_test", entities=[Entity("ticker", ValueType.STRING)]
+        )
+        fs.ingest(stocks_set, stocks)
+
+        vector = fs.FeatureVector("SjqevLXR", ["stocks_test.*"])
+        fs.get_offline_features(vector)
+
+        actual_stat = vector.get_stats_table().drop("hist", axis=1, errors="ignore")
+        actual_stat = actual_stat.sort_index().sort_index(axis=1)
+        assert isinstance(actual_stat["top"]["booly"], bool)
+
     def test_serverless_ingest(self):
         key = "patient_id"
         measurements = fs.FeatureSet(
@@ -472,6 +498,18 @@ class TestFeatureStore(TestMLRunSystem):
 
         resp = fs.ingest(measurements, source, return_df=True,)
         assert len(resp) == 10
+
+        # start time > timestamp in source
+        source = ParquetSource(
+            "myparquet",
+            path=os.path.relpath(str(self.assets_path / "testdata.parquet")),
+            time_field="timestamp",
+            start_time=datetime(2022, 12, 1, 17, 33, 15),
+            end_time="2022-12-01 17:33:16",
+        )
+
+        resp = fs.ingest(measurements, source, return_df=True,)
+        assert len(resp) == 0
 
     @pytest.mark.parametrize("key_bucketing_number", [None, 0, 4])
     @pytest.mark.parametrize("partition_cols", [None, ["department"]])
@@ -1500,6 +1538,46 @@ class TestFeatureStore(TestMLRunSystem):
         targets_to_purge = targets[:-1]
         verify_purge(fset, targets_to_purge)
 
+    def test_purge_nosql(self):
+        def get_v3io_api_host():
+            """Return only the host out of v3io_api
+
+            Takes the parameter from config and strip it from it's protocol and port
+            returning only the host name.
+            """
+            api = None
+            if config.v3io_api:
+                api = config.v3io_api
+                if "//" in api:
+                    api = api[api.find("//") + 2 :]
+                if ":" in api:
+                    api = api[: api.find(":")]
+            return api
+
+        key = "patient_id"
+        fset = fs.FeatureSet(
+            name="nosqlpurge", entities=[Entity(key)], timestamp_key="timestamp"
+        )
+        path = os.path.relpath(str(self.assets_path / "testdata.csv"))
+        source = CSVSource("mycsv", path=path, time_field="timestamp",)
+        targets = [
+            NoSqlTarget(
+                name="nosql", path="v3io:///bigdata/system-test-project/nosql-purge"
+            ),
+            NoSqlTarget(
+                name="fullpath",
+                path=f"v3io://webapi.{get_v3io_api_host()}/bigdata/system-test-project/nosql-purge-full",
+            ),
+        ]
+
+        for tar in targets:
+            test_target = [tar]
+            fset.set_targets(
+                with_defaults=False, targets=test_target,
+            )
+            fs.ingest(fset, source)
+            verify_purge(fset, test_target)
+
     def test_ingest_dataframe_index(self):
         orig_df = pd.DataFrame([{"x", "y"}])
         orig_df.index.name = "idx"
@@ -1667,6 +1745,63 @@ class TestFeatureStore(TestMLRunSystem):
             "foreignkey2": {"mykey1": "C", "mykey2": "F"},
             "aug": {"mykey1": "1", "mykey2": "2"},
         }
+
+    def test_online_impute(self):
+        data = pd.DataFrame(
+            {
+                "time_stamp": [
+                    pd.Timestamp("2016-05-25 13:31:00.000"),
+                    pd.Timestamp("2016-05-25 13:32:00.000"),
+                    pd.Timestamp("2016-05-25 13:33:00.000"),
+                ],
+                "data": [10, 20, 60],
+                "name": ["ab", "cd", "ef"],
+            }
+        )
+
+        data_set1 = fs.FeatureSet(
+            "imp1", entities=[Entity("name")], timestamp_key="time_stamp"
+        )
+        data_set1.add_aggregation(
+            "datas", "data", ["avg", "max"], "1h",
+        )
+        fs.ingest(data_set1, data, infer_options=fs.InferOptions.default())
+
+        data2 = pd.DataFrame({"data2": [1, None, np.inf], "name": ["ab", "cd", "ef"]})
+
+        data_set2 = fs.FeatureSet("imp2", entities=[Entity("name")])
+        fs.ingest(data_set2, data2, infer_options=fs.InferOptions.default())
+
+        features = ["imp1.datas_avg_1h", "imp1.datas_max_1h", "imp2.data2"]
+
+        # create vector and online service with imputing policy
+        vector = fs.FeatureVector("vectori", features)
+        svc = fs.get_online_feature_service(
+            vector, impute_policy={"*": "$max", "datas_avg_1h": "$mean", "data2": 4}
+        )
+        print(svc.vector.status.to_yaml())
+
+        resp = svc.get([{"name": "ab"}])
+        assert resp[0]["data2"] == 1
+        assert resp[0]["datas_max_1h"] == 60
+        assert resp[0]["datas_avg_1h"] == 30
+
+        resp = svc.get([{"name": "cd"}])
+        assert resp[0]["data2"] == 4
+        assert resp[0]["datas_max_1h"] == 60
+        assert resp[0]["datas_avg_1h"] == 30
+
+        resp = svc.get([{"name": "ef"}])
+        assert resp[0]["data2"] == 4
+        assert resp[0]["datas_max_1h"] == 60
+        assert resp[0]["datas_avg_1h"] == 30
+
+        # check without impute
+        vector = fs.FeatureVector("vectori2", features)
+        svc = fs.get_online_feature_service(vector)
+        resp = svc.get([{"name": "cd"}])
+        assert np.isnan(resp[0]["data2"])
+        assert np.isnan(resp[0]["datas_avg_1h"])
 
 
 def verify_purge(fset, targets):

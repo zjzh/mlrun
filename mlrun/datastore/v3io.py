@@ -21,7 +21,7 @@ import v3io.dataplane
 
 import mlrun
 
-from ..platforms.iguazio import split_path
+from ..platforms.iguazio import parse_v3io_path, split_path
 from .base import (
     DataStore,
     FileStats,
@@ -86,7 +86,10 @@ class V3ioStore(DataStore):
         return self._filesystem
 
     def get_storage_options(self):
-        return dict(v3io_access_key=self._get_secret_or_env("V3IO_ACCESS_KEY"))
+        return dict(
+            v3io_access_key=self._get_secret_or_env("V3IO_ACCESS_KEY"),
+            v3io_api=mlrun.mlconf.v3io_api,
+        )
 
     def upload(self, key, src_path):
         http_upload(self.url + self._join(key), src_path, self.headers, None)
@@ -147,8 +150,9 @@ class V3ioStore(DataStore):
             path = [path]
         maxdepth = maxdepth if not maxdepth else maxdepth - 1
         to_rm = set()
-        path = [fs._strip_protocol(p) for p in path]
         for p in path:
+            _, p = parse_v3io_path(p, suffix="")
+            p = "/" + p
             if recursive:
                 find_out = fs.find(p, maxdepth=maxdepth, withdirs=True, detail=True)
                 rec = set(
