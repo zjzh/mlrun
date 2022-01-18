@@ -182,6 +182,7 @@ class TestProject(TestMLRunSystem):
         state = pipeline["run"]["status"]
         assert state == mlrun.run.RunStatuses.succeeded, "pipeline failed"
         self._delete_test_project(name)
+        self._delete_test_project(project2.metadata.name)
 
     def test_inline_pipeline(self):
         name = "pipe5"
@@ -189,7 +190,8 @@ class TestProject(TestMLRunSystem):
         shutil.rmtree(project_dir, ignore_errors=True)
         project = self._create_project(name, True)
         run = project.run(
-            artifact_path=f"v3io:///projects/{name}", workflow_handler=pipe_test,
+            artifact_path=f"v3io:///projects/{name}/artifacts",
+            workflow_handler=pipe_test,
         )
         run.wait_for_completion()
         assert run.state == mlrun.run.RunStatuses.succeeded, "pipeline failed"
@@ -257,3 +259,4 @@ class TestProject(TestMLRunSystem):
         out = exec_project(args, projects_dir)
         print("OUT:\n", out)
         assert out.find("pipeline run finished, state=Succeeded"), "pipeline failed"
+        self._delete_test_project(name)

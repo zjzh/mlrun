@@ -29,7 +29,7 @@ import numpy as np
 import requests
 import yaml
 from dateutil import parser
-from pandas._libs.tslibs.timestamps import Timestamp
+from pandas._libs.tslibs.timestamps import Timedelta, Timestamp
 from tabulate import tabulate
 from yaml.representer import RepresenterError
 
@@ -160,6 +160,47 @@ def verify_field_list_of_type(
     verify_field_of_type(field_name, field_value, list)
     for element in field_value:
         verify_field_of_type(field_name, element, expected_element_type)
+
+
+def verify_dict_items_type(
+    name: str,
+    dictionary: dict,
+    expected_keys_types: list = None,
+    expected_values_types: list = None,
+):
+    if dictionary:
+        if type(dictionary) != dict:
+            raise mlrun.errors.MLRunInvalidArgumentTypeError(
+                f"{name} expected to be of type dict, got type : {type(dictionary)}"
+            )
+        try:
+            verify_list_items_type(dictionary.keys(), expected_keys_types)
+            verify_list_items_type(dictionary.values(), expected_values_types)
+        except mlrun.errors.MLRunInvalidArgumentTypeError as exc:
+            raise mlrun.errors.MLRunInvalidArgumentTypeError(
+                f"{name} should be of type Dict[{get_pretty_types_names(expected_keys_types)},"
+                f"{get_pretty_types_names(expected_values_types)}]."
+            ) from exc
+
+
+def verify_list_items_type(list_, expected_types: list = None):
+    if list_ and expected_types:
+        list_items_types = set(map(type, list_))
+        expected_types = set(expected_types)
+
+        if not list_items_types.issubset(expected_types):
+            raise mlrun.errors.MLRunInvalidArgumentTypeError(
+                f"Found unexpected types in list items. expected: {expected_types},"
+                f" found: {list_items_types} in : {list_}"
+            )
+
+
+def get_pretty_types_names(types):
+    if len(types) == 0:
+        return ""
+    if len(types) > 1:
+        return "Union[" + ",".join([ty.__name__ for ty in types]) + "]"
+    return types[0].__name__
 
 
 def now_date():
@@ -415,6 +456,8 @@ def uxjoin(base, local_path, key="", iter=None, is_dir=False):
     if base and not base.endswith("/"):
         base += "/"
     base_str = base or ""
+    if local_path.startswith("./"):
+        local_path = local_path[len("./") :]
     return f"{base_str}{local_path}"
 
 
@@ -563,7 +606,9 @@ def new_pipe_meta(artifact_path=None, ttl=None, *args):
 
 def enrich_image_url(image_url: str) -> str:
     image_url = image_url.strip()
-    tag = config.images_tag or mlrun.utils.version.Version().get()["version"]
+    tag = config.images_tag or mlrun.utils.version.Version().get()["version"].replace(
+        "+", "-"
+    ).replace("0.0.0-", "")
     registry = config.images_registry
 
     # it's an mlrun image if the repository is mlrun
@@ -767,6 +812,15 @@ def get_ui_url(project, uid=None):
     return url
 
 
+def get_workflow_url(project, id=None):
+    url = ""
+    if mlrun.mlconf.resolve_ui_url():
+        url = "{}/{}/{}/jobs/monitor-workflows/workflow/{}".format(
+            mlrun.mlconf.resolve_ui_url(), mlrun.mlconf.ui.projects_prefix, project, id
+        )
+    return url
+
+
 class RunNotifications:
     def __init__(self, with_ipython=True, with_slack=False, secrets=None):
         self._hooks = []
@@ -778,7 +832,9 @@ class RunNotifications:
             self.slack()
         self.print(skip_ipython=True)
 
-    def push_start_message(self, project, commit_id=None, id=None):
+    def push_start_message(
+        self, project, commit_id=None, id=None, has_workflow_url=False
+    ):
         message = f"Pipeline started in project {project}"
         if id:
             message += f" id={id}"
@@ -787,12 +843,15 @@ class RunNotifications:
         )
         if commit_id:
             message += f", commit={commit_id}"
-        url = get_ui_url(project)
+        if has_workflow_url:
+            url = get_workflow_url(project, id)
+        else:
+            url = get_ui_url(project)
         html = ""
         if url:
             html = (
                 message
-                + f'<div><a href="{url}" target="_blank">click here to check progress</a></div>'
+                + f'<div><a href="{url}" target="_blank">click here to view progress</a></div>'
             )
             message = message + f", check progress in {url}"
         self.push(message, html=html)
@@ -1076,3 +1135,41 @@ def fill_artifact_path_template(artifact_path, project):
         artifact_path = artifact_path.replace("{{run.project}}", project)
         artifact_path = artifact_path.replace("{{project}}", project)
     return artifact_path
+
+
+def str_to_timestamp(time_str: str, now_time: Timestamp = None):
+    """convert fixed/relative time string to Pandas Timestamp
+
+    can use relative times using the "now" verb, and align to floor using the "floor" verb
+
+    time string examples::
+
+        1/1/2021
+        now
+        now + 1d2h
+        now -1d floor 1H
+    """
+    if not isinstance(time_str, str):
+        return time_str
+
+    time_str = time_str.strip()
+    if time_str.lower().startswith("now"):
+        # handle now +/- timedelta
+        timestamp: Timestamp = now_time or Timestamp.now()
+        time_str = time_str[len("now") :].lstrip()
+        split = time_str.split("floor")
+        time_str = split[0].strip()
+
+        if time_str and time_str[0] in ["+", "-"]:
+            timestamp = timestamp + Timedelta(time_str)
+        elif time_str:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"illegal time string expression now{time_str}, "
+                'use "now +/- <timestring>" for relative times'
+            )
+
+        if len(split) > 1:
+            timestamp = timestamp.floor(split[1].strip())
+        return timestamp
+
+    return Timestamp(time_str)

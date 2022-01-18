@@ -57,6 +57,7 @@ class WorkflowSpec(mlrun.model.ModelObj):
         name=None,
         handler=None,
         ttl=None,
+        args_schema: dict = None,
     ):
         self.engine = engine
         self.code = code
@@ -65,6 +66,7 @@ class WorkflowSpec(mlrun.model.ModelObj):
         self.name = name
         self.handler = handler
         self.ttl = ttl
+        self.args_schema = args_schema
         self.run_local = False
         self._tmp_path = None
 
@@ -87,9 +89,23 @@ class WorkflowSpec(mlrun.model.ModelObj):
 
     def merge_args(self, extra_args):
         self.args = self.args or {}
+        required = []
+        if self.args_schema:
+            for schema in self.args_schema:
+                name = schema.get("name")
+                if name not in self.args:
+                    self.args[name] = schema.get("default")
+                if schema.get("required"):
+                    required.append(name)
         if extra_args:
             for k, v in extra_args.items():
                 self.args[k] = v
+                if k in required:
+                    required.remove(k)
+        if required:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"workflow argument(s) {','.join(required)} are required and were not specified"
+            )
 
     def clear_tmp(self):
         if self._tmp_path:
@@ -107,8 +123,12 @@ class FunctionsDict:
     def _functions(self):
         return self.project.spec._function_objects
 
-    def _enrich(self, function):
-        return enrich_function_object(self.project, function, self._decorator)
+    def enrich(self, function, key):
+        enriched_function = enrich_function_object(
+            self.project, function, self._decorator
+        )
+        self._functions[key] = enriched_function  # update the cache
+        return self._functions[key]
 
     def load_or_set_function(self, key, default=None) -> mlrun.runtimes.BaseRuntime:
         try:
@@ -118,8 +138,7 @@ class FunctionsDict:
                 raise e
             function = default
 
-        self._functions[key] = self._enrich(function)
-        return self._functions[key]
+        return self.enrich(function, key)
 
     def get(self, key, default=None) -> mlrun.runtimes.BaseRuntime:
         return self.load_or_set_function(key, default)
@@ -131,13 +150,15 @@ class FunctionsDict:
         self._functions[key] = val
 
     def values(self):
-        return self._functions.values()
+        return [self.enrich(function, key) for key, function in self._functions.items()]
 
     def keys(self):
         return self._functions.keys()
 
     def items(self):
-        return self._functions.items()
+        return {
+            key: self.enrich(function, key) for key, function in self._functions.items()
+        }
 
     def __len__(self):
         return len(self._functions)
@@ -184,10 +205,6 @@ class _PipelineContext:
             )
         return False
 
-    def enrich_function(self, function) -> mlrun.runtimes.BaseRuntime:
-        self.is_initialized(raise_exception=True)
-        return self.functions._enrich(function)
-
 
 pipeline_context = _PipelineContext()
 
@@ -223,6 +240,8 @@ def enrich_function_object(
             f.spec.build.source = project.spec.source
             f.spec.build.load_source_on_run = project.spec.load_source_on_run
 
+    if project.spec.default_requirements:
+        f.with_requirements(project.spec.default_requirements)
     if decorator:
         decorator(f)
 
@@ -364,7 +383,7 @@ class _KFPRunner(_PipelineRunner):
             ttl=workflow_spec.ttl,
         )
         project.notifiers.push_start_message(
-            project.metadata.name, project.get_param("commit_id", None), id
+            project.metadata.name, project.get_param("commit_id", None), id, True,
         )
         pipeline_context.clear()
         return _PipelineRunStatus(id, cls, project=project, workflow=workflow_spec)

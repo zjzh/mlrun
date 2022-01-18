@@ -5,10 +5,12 @@ from http import HTTPStatus
 
 import deepdiff
 import nuclio
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from mlrun import mlconf
+from mlrun.api.utils.singletons.k8s import get_k8s
 from mlrun.db import SQLDB
 from mlrun.runtimes.function import NuclioStatus, deploy_nuclio_function
 
@@ -208,7 +210,22 @@ class TestServingRuntime(TestNuclioRuntime):
 
         assert deepdiff.DeepDiff(resp, expected_response) == {}
 
+    def test_mock_bad_step(self, db: Session, client: TestClient):
+        function = self._generate_runtime(self.runtime_kind)
+        graph = function.set_topology("flow", exist_ok=True, engine="sync")
+
+        graph.add_step(
+            name="extend", class_name="storey.Extend", _fn='({"tag": "something"})'
+        )
+
+        server = function.to_mock_server()
+        with pytest.raises(RuntimeError):
+            server.test()
+
     def test_serving_with_secrets_remote_build(self, db: Session, client: TestClient):
+        orig_function = get_k8s()._get_project_secrets_raw_data
+        get_k8s()._get_project_secrets_raw_data = unittest.mock.Mock(return_value={})
+
         function = self._create_serving_function()
 
         # Simulate a remote build by issuing client's API. Code below is taken from httpdb.
@@ -217,11 +234,13 @@ class TestServingRuntime(TestNuclioRuntime):
             "with_mlrun": "no",
             "mlrun_version_specifier": "0.6.0",
         }
-        response = client.post("/api/build/function", json=req)
+        response = client.post("build/function", json=req)
 
         assert response.status_code == HTTPStatus.OK.value
 
         self._assert_deploy_called_basic_config(expected_class=self.class_name)
+
+        get_k8s()._get_project_secrets_raw_data = orig_function
 
     def test_child_functions_with_secrets(self, db: Session, client: TestClient):
         function = self._create_serving_function()
@@ -251,7 +270,7 @@ class TestServingRuntime(TestNuclioRuntime):
             {
                 "function_name": f"{self.project}-{self.name}-child_function",
                 "file_name": child_function_path,
-                "parent_function": function._function_uri(),
+                "parent_function": function.metadata.name,
             },
             {
                 "function_name": f"{self.project}-{self.name}",

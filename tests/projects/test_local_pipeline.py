@@ -1,6 +1,8 @@
 import pathlib
 import sys
 
+import pytest
+
 import mlrun
 from tests.conftest import out_path
 
@@ -23,9 +25,18 @@ class TestNewProject:
             image="mlrun/mlrun",
             # kind="job"
         )
-        proj.set_artifact("data", mlrun.artifacts.Artifact(target_path=data_url))
+        proj.set_artifact("data", target_path=data_url)
         proj.spec.params = {"label_column": "label"}
         return proj
+
+    def test_set_artifact(self):
+        project = mlrun.new_project("test-sa")
+        project.set_artifact("data1", mlrun.artifacts.Artifact(target_path=data_url))
+        project.set_artifact("data2", target_path=data_url)  # test the short form
+
+        for artifact in project.spec.artifacts:
+            assert artifact["key"] in ["data1", "data2"]
+            assert artifact["target_path"] == data_url
 
     def test_run_alone(self):
         mlrun.projects.pipeline_context.clear(with_project=True)
@@ -72,3 +83,36 @@ class TestNewProject:
         assert run_result.state() == "completed", "run didnt complete"
         # expect y = (param1 * 2) + 1 = 15
         assert run_result.output("y") == 15, "unexpected run result"
+
+    def test_pipeline_args(self):
+        mlrun.projects.pipeline_context.clear(with_project=True)
+        project = self._create_project("localpipe3")
+        args = [
+            mlrun.model.EntrypointParam("param1", type="int", doc="p1", required=True),
+            mlrun.model.EntrypointParam("param2", type="str", default="abc", doc="p2"),
+        ]
+        project.set_workflow(
+            "main",
+            str(f'{self.assets_path / "localpipe.py"}'),
+            handler="args_pipe",
+            args_schema=args,
+        )
+        with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+            # expect an exception when param1 (required) arg is not specified
+            project.run("main", local=True)
+
+        project.run("main", local=True, arguments={"param1": 6})
+        run_result: mlrun.RunObject = mlrun.projects.pipeline_context._test_result
+        print(run_result.to_yaml())
+        # expect p1 = param1, p2 = default for param2 (abc)
+        assert (
+            run_result.output("p1") == 6 and run_result.output("p2") == "abc"
+        ), "wrong arg values"
+
+        project.run("main", local=True, arguments={"param1": 6, "param2": "xy"})
+        run_result: mlrun.RunObject = mlrun.projects.pipeline_context._test_result
+        print(run_result.to_yaml())
+        # expect p1=param1, p2=xy
+        assert (
+            run_result.output("p1") == 6 and run_result.output("p2") == "xy"
+        ), "wrong arg values"

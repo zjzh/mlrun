@@ -1,7 +1,9 @@
+import json
 import os
 import pathlib
 import random
 import string
+import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from time import sleep
@@ -18,7 +20,7 @@ import mlrun
 import mlrun.feature_store as fs
 import tests.conftest
 from mlrun.config import config
-from mlrun.data_types.data_types import ValueType
+from mlrun.data_types.data_types import InferOptions, ValueType
 from mlrun.datastore.sources import (
     CSVSource,
     DataFrameSource,
@@ -82,6 +84,15 @@ class TestFeatureStore(TestMLRunSystem):
         stocks_set = fs.FeatureSet(
             "stocks", entities=[Entity("ticker", ValueType.STRING)]
         )
+
+        with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+            fs.ingest(
+                stocks_set,
+                stocks,
+                infer_options=fs.InferOptions.default(),
+                run_config=fs.RunConfig(local=True),
+            )
+
         df = fs.ingest(stocks_set, stocks, infer_options=fs.InferOptions.default())
 
         self._logger.info(f"output df:\n{df}")
@@ -95,7 +106,7 @@ class TestFeatureStore(TestMLRunSystem):
         assert stocks_set.status.stats["exchange"], "stats not created"
 
     def _ingest_quotes_featureset(self):
-        quotes_set = FeatureSet("stock-quotes", entities=[Entity("ticker")])
+        quotes_set = FeatureSet("stock-quotes", entities=["ticker"])
 
         flow = quotes_set.graph
         flow.to("MyMap", multiplier=3).to(
@@ -104,9 +115,21 @@ class TestFeatureStore(TestMLRunSystem):
             FeaturesetValidator()
         )
 
-        quotes_set.add_aggregation("asks1", "ask", ["sum", "max"], "1h", "10m")
-        quotes_set.add_aggregation("asks2", "ask", ["sum", "max"], "5h", "10m")
-        quotes_set.add_aggregation("bids", "bid", ["min", "max"], "1h", "10m")
+        quotes_set.add_aggregation("ask", ["sum", "max"], "1h", "10m", name="asks1")
+        quotes_set.add_aggregation("ask", ["sum", "max"], "5h", "10m", name="asks2")
+        quotes_set.add_aggregation("bid", ["min"], "1h", "10m")
+
+        with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+            # no name parameter, different window
+            quotes_set.add_aggregation("bid", ["max"], "5h", "10m")
+
+        with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+            # no name parameter, different period
+            quotes_set.add_aggregation("bid", ["max"], "1h", "5m")
+
+        quotes_set.add_aggregation(
+            column="bid", operations=["max"], windows="1h", period="10m"
+        )
 
         df = fs.preview(
             quotes_set,
@@ -126,10 +149,10 @@ class TestFeatureStore(TestMLRunSystem):
         self._logger.info(f"output df:\n{df}")
         assert quotes_set.status.stats.get("asks1_sum_1h"), "stats not created"
 
-    def _get_offline_vector(self, features, features_size):
+    def _get_offline_vector(self, features, features_size, engine=None):
         vector = fs.FeatureVector("myvector", features, "stock-quotes.xx")
         resp = fs.get_offline_features(
-            vector, entity_rows=trades, entity_timestamp_column="time",
+            vector, entity_rows=trades, entity_timestamp_column="time", engine=engine
         )
         assert len(vector.spec.features) == len(
             features
@@ -145,12 +168,12 @@ class TestFeatureStore(TestMLRunSystem):
         df = resp.to_dataframe()
         columns = trades.shape[1] + features_size - 2  # - 2 keys
         assert df.shape[1] == columns, "unexpected num of returned df columns"
-        resp.to_parquet(str(self.results_path / "query.parquet"))
+        resp.to_parquet(str(self.results_path / f"query-{engine}.parquet"))
 
         # check simple api without join with other df
         # test the use of vector uri
         vector.save()
-        resp = fs.get_offline_features(vector.uri)
+        resp = fs.get_offline_features(vector.uri, engine=engine)
         df = resp.to_dataframe()
         assert df.shape[1] == features_size, "unexpected num of returned df columns"
 
@@ -208,7 +231,12 @@ class TestFeatureStore(TestMLRunSystem):
         features_size = (
             len(features) + 1 + 1
         )  # (*) returns 2 features, label adds 1 feature
-        self._get_offline_vector(features, features_size)
+
+        # test fetch with the pandas merger engine
+        self._get_offline_vector(features, features_size, engine="local")
+
+        # test fetch with the dask merger engine
+        self._get_offline_vector(features, features_size, engine="dask")
 
         self._logger.debug("Get online feature vector")
         self._get_online_features(features, features_size)
@@ -300,7 +328,7 @@ class TestFeatureStore(TestMLRunSystem):
 
     def test_feature_set_db(self):
         name = "stocks_test"
-        stocks_set = fs.FeatureSet(name, entities=[Entity("ticker", ValueType.STRING)])
+        stocks_set = fs.FeatureSet(name, entities=["ticker"])
         fs.preview(
             stocks_set, stocks,
         )
@@ -439,7 +467,7 @@ class TestFeatureStore(TestMLRunSystem):
             }
         )
 
-        csv_path = "/tmp/multiple_time_columns.csv"
+        csv_path = tempfile.mktemp(".csv")
         df.to_csv(path_or_buf=csv_path, index=False)
         source = CSVSource(
             path=csv_path, time_field="time_stamp", parse_dates=["another_time_column"]
@@ -545,8 +573,9 @@ class TestFeatureStore(TestMLRunSystem):
             f"{name}.*",
         ]
         vector = fs.FeatureVector("myvector", features)
-        vector.spec.with_indexes = True
-        resp2 = fs.get_offline_features(vector, entity_timestamp_column="timestamp")
+        resp2 = fs.get_offline_features(
+            vector, entity_timestamp_column="timestamp", with_indexes=True
+        )
         resp2 = resp2.to_dataframe().to_dict()
 
         assert resp1 == resp2
@@ -585,7 +614,7 @@ class TestFeatureStore(TestMLRunSystem):
         resp = fs.get_offline_features(
             vector,
             start_time=datetime(2020, 12, 1, 17, 33, 15),
-            end_time=datetime(2020, 12, 1, 17, 33, 16),
+            end_time="2020-12-01 17:33:16",
             entity_timestamp_column="timestamp",
         )
         resp2 = resp.to_dataframe()
@@ -620,8 +649,7 @@ class TestFeatureStore(TestMLRunSystem):
             f"{name}.*",
         ]
         vector = fs.FeatureVector("myvector", features)
-        vector.spec.with_indexes = True
-        resp2 = fs.get_offline_features(vector)
+        resp2 = fs.get_offline_features(vector, with_indexes=True)
         resp2 = resp2.to_dataframe()
         assert resp2.to_dict() == {
             "my_string": {"mykey1": "hello"},
@@ -762,11 +790,7 @@ class TestFeatureStore(TestMLRunSystem):
         )
 
         data_set.add_aggregation(
-            name="bids",
-            column="bid",
-            operations=["sum", "max"],
-            windows="1h",
-            period="10m",
+            column="bid", operations=["sum", "max"], windows="1h", period="10m",
         )
         fs.preview(
             data_set,
@@ -782,14 +806,14 @@ class TestFeatureStore(TestMLRunSystem):
         fs.ingest(data_set, data, return_df=True)
 
         features = [
-            f"{name}.bids_sum_1h",
+            f"{name}.bid_sum_1h",
         ]
 
         vector = fs.FeatureVector("my-vec", features)
         svc = fs.get_online_feature_service(vector)
 
         resp = svc.get([{"first_name": "yosi", "last_name": "levi"}])
-        assert resp[0]["bids_sum_1h"] == 37.0
+        assert resp[0]["bid_sum_1h"] == 37.0
 
         svc.close()
 
@@ -833,7 +857,7 @@ class TestFeatureStore(TestMLRunSystem):
         resp = fs.get_offline_features(
             vector,
             entity_timestamp_column="time_stamp",
-            start_time=datetime(2021, 6, 9, 9, 30),
+            start_time="2021-06-09 09:30",
             end_time=datetime(2021, 6, 9, 10, 30),
         )
 
@@ -1300,6 +1324,39 @@ class TestFeatureStore(TestMLRunSystem):
         assert "exchange" not in features, "field was not dropped"
         assert len(df) == len(stocks), "dataframe size doesnt match"
 
+    @pytest.mark.parametrize("with_graph", [True, False])
+    def test_sync_pipeline_chunks(self, with_graph):
+        myset = fs.FeatureSet(
+            "early_sense",
+            entities=[Entity("patient_id")],
+            timestamp_key="timestamp",
+            engine="pandas",
+        )
+
+        csv_file = os.path.relpath(str(self.assets_path / "testdata.csv"))
+        original_df = pd.read_csv(csv_file)
+        original_cols = original_df.shape[1]
+        print(original_df.shape)
+        print(original_df.info())
+
+        chunksize = 100
+        source = CSVSource("mycsv", path=csv_file, attributes={"chunksize": chunksize})
+        if with_graph:
+            myset.graph.to(name="s1", handler="my_func")
+
+        df = fs.ingest(myset, source)
+        self._logger.info(f"output df:\n{df}")
+
+        features = list(myset.spec.features.keys())
+        print(len(features), features)
+        print(myset.to_yaml())
+        print(df.shape)
+        # original cols - index - timestamp cols
+        assert len(features) == original_cols - 2, "wrong num of features"
+        assert df.shape[1] == original_cols, "num of cols not as expected"
+        # returned DF is only the first chunk (size 100)
+        assert df.shape[0] == chunksize, "dataframe size doesnt match"
+
     def test_target_list_validation(self):
         targets = [ParquetTarget()]
         verify_target_list_fail(targets, with_defaults=True)
@@ -1348,9 +1405,7 @@ class TestFeatureStore(TestMLRunSystem):
 
     def test_post_aggregation_step(self):
         quotes_set = fs.FeatureSet("post-aggregation", entities=[fs.Entity("ticker")])
-        agg_step = quotes_set.add_aggregation(
-            "asks", "ask", ["sum", "max"], "1h", "10m"
-        )
+        agg_step = quotes_set.add_aggregation("ask", ["sum", "max"], "1h", "10m")
         agg_step.to("MyMap", "somemap1", field="multi1", multiplier=3)
 
         # Make sure the map step was added right after the aggregation step
@@ -1713,6 +1768,18 @@ class TestFeatureStore(TestMLRunSystem):
         svc.close()
         assert resp[0]["bid"] == 300
 
+    def test_get_offline_from_feature_set_with_no_schema(self):
+        myset = FeatureSet("fset2", entities=[Entity("ticker")])
+        fs.ingest(myset, quotes, infer_options=InferOptions.Null)
+        features = ["fset2.*"]
+        vector = fs.FeatureVector("QVMytLdP", features, with_indexes=True)
+
+        try:
+            fs.get_offline_features(vector)
+            assert False
+        except mlrun.errors.MLRunInvalidArgumentError:
+            pass
+
     def test_join_with_table(self):
         table_url = "v3io:///bigdata/system-test-project/nosql/test_join_with_table"
 
@@ -1746,6 +1813,197 @@ class TestFeatureStore(TestMLRunSystem):
             "aug": {"mykey1": "1", "mykey2": "2"},
         }
 
+    def test_get_offline_features_with_tag(self):
+        def validate_result(test_vector, test_keys):
+            res_set = fs.get_offline_features(test_vector)
+            assert res_set is not None
+            res_keys = list(res_set.vector.status.stats.keys())
+            assert res_keys.sort() == test_keys.sort()
+
+        data = quotes
+        name = "quotes"
+        tag = "test"
+        project = self.project_name
+
+        test_set = fs.FeatureSet(name, entities=[Entity("ticker", ValueType.STRING)])
+
+        df = fs.ingest(test_set, data)
+        assert df is not None
+
+        # change feature set and save with tag
+        test_set.add_aggregation(
+            "bid", ["avg"], "1h",
+        )
+        new_column = "bid_avg_1h"
+        test_set.metadata.tag = tag
+        fs.ingest(test_set, data)
+
+        # retrieve feature set with feature vector and check for changes
+        vector = fs.FeatureVector("vector", [f"{name}.*"], with_indexes=True)
+        vector_with_tag = fs.FeatureVector(
+            "vector_with_tag", [f"{name}:{tag}.*"], with_indexes=True
+        )
+        vector_with_project = fs.FeatureVector(
+            "vector_with_project", [f"{project}/{name}.*"], with_indexes=True
+        )
+        # vector_with_project.metadata.project = "bs"
+        vector_with_features = fs.FeatureVector(
+            "vector_with_features", [f"{name}.bid", f"{name}.time"], with_indexes=True
+        )
+        vector_with_project_tag_and_features = fs.FeatureVector(
+            "vector_with_project_tag_and_features",
+            [f"{project}/{name}:{tag}.bid", f"{project}/{name}:{tag}.{new_column}"],
+            with_indexes=True,
+        )
+
+        expected_keys = ["time", "bid", "ask"]
+
+        for vec, keys in [
+            (vector, expected_keys),
+            (vector_with_tag, expected_keys + [new_column]),
+            (vector_with_project, expected_keys),
+            (vector_with_features, ["bid", "time"]),
+            (vector_with_project_tag_and_features, ["bid", new_column]),
+        ]:
+            validate_result(vec, keys)
+
+    def test_get_online_feature_service_with_tag(self):
+        def validate_result(test_vector, test_keys):
+            svc = fs.get_online_feature_service(test_vector)
+            sleep(5)
+            resp = svc.get([{"ticker": "AAPL"}])
+            svc.close()
+            assert resp is not None
+            resp_keys = list(resp[0].keys())
+            assert resp_keys.sort() == test_keys.sort()
+
+        data = quotes
+        name = "quotes"
+        tag = "test"
+        project = self.project_name
+
+        test_set = fs.FeatureSet(name, entities=[Entity("ticker", ValueType.STRING)])
+
+        df = fs.ingest(test_set, data)
+        assert df is not None
+
+        # change feature set and save with tag
+        test_set.add_aggregation(
+            "bid", ["avg"], "1h",
+        )
+        new_column = "bid_avg_1h"
+        test_set.metadata.tag = tag
+        fs.ingest(test_set, data)
+
+        # retrieve feature set with feature vector and check for changes
+        vector = fs.FeatureVector("vector", [f"{name}.*"], with_indexes=True)
+        vector_with_tag = fs.FeatureVector(
+            "vector_with_tag", [f"{name}:{tag}.*"], with_indexes=True
+        )
+        vector_with_project = fs.FeatureVector(
+            "vector_with_project", [f"{project}/{name}.*"], with_indexes=True
+        )
+        # vector_with_project.metadata.project = "bs"
+        vector_with_features = fs.FeatureVector(
+            "vector_with_features", [f"{name}.bid", f"{name}.time"], with_indexes=True
+        )
+        vector_with_project_tag_and_features = fs.FeatureVector(
+            "vector_with_project_tag_and_features",
+            [f"{project}/{name}:{tag}.bid", f"{project}/{name}:{tag}.{new_column}"],
+            with_indexes=True,
+        )
+
+        expected_keys = ["ticker", "time", "bid", "ask"]
+
+        for vec, keys in [
+            (vector, expected_keys),
+            (vector_with_tag, expected_keys + [new_column]),
+            (vector_with_project, expected_keys),
+            (vector_with_features, ["bid", "time"]),
+            (vector_with_project_tag_and_features, ["bid", new_column]),
+        ]:
+            validate_result(vec, keys)
+
+    def test_preview_saves_changes(self):
+        name = "update-on-preview"
+        v3io_source = StreamSource(key_field="ticker", time_field="time")
+        fset = fs.FeatureSet(name, timestamp_key="time", entities=[Entity("ticker")])
+        import v3io.dataplane
+
+        v3io_client = v3io.dataplane.Client()
+
+        stream_path = f"/{self.project_name}/FeatureStore/{name}/v3ioStream"
+        try:
+            v3io_client.stream.delete(container="projects", stream_path=stream_path)
+        finally:
+            v3io_client.stream.create(
+                container="projects", stream_path=stream_path, shard_count=1
+            )
+
+        record = {
+            "data": json.dumps(
+                {
+                    "ticker": "AAPL",
+                    "time": "2021-08-15T10:58:37.415101",
+                    "bid": 300,
+                    "ask": 100,
+                }
+            )
+        }
+
+        v3io_client.stream.put_records(
+            container="projects", stream_path=stream_path, records=[record]
+        )
+
+        fs.preview(
+            featureset=fset,
+            source=quotes,
+            entity_columns=["ticker"],
+            timestamp_key="time",
+        )
+
+        filename = str(
+            pathlib.Path(tests.conftest.tests_root_directory)
+            / "api"
+            / "runtimes"
+            / "assets"
+            / "sample_function.py"
+        )
+
+        function = mlrun.code_to_function(
+            "ingest_transactions", kind="serving", filename=filename
+        )
+        function.spec.default_content_type = "application/json"
+        run_config = fs.RunConfig(function=function, local=False).apply(
+            mlrun.mount_v3io()
+        )
+        fs.deploy_ingestion_service(
+            featureset=fset,
+            source=v3io_source,
+            run_config=run_config,
+            targets=[ParquetTarget(flush_after_seconds=1)],
+        )
+
+        record = {
+            "data": json.dumps(
+                {
+                    "ticker": "AAPL",
+                    "time": "2021-08-15T10:58:37.415101",
+                    "bid": 400,
+                    "ask": 200,
+                }
+            )
+        }
+
+        v3io_client.stream.put_records(
+            container="projects", stream_path=stream_path, records=[record]
+        )
+
+        features = [f"{name}.*"]
+        vector = fs.FeatureVector("vecc", features, with_indexes=True)
+
+        fs.get_offline_features(vector)
+
     def test_online_impute(self):
         data = pd.DataFrame(
             {
@@ -1763,7 +2021,7 @@ class TestFeatureStore(TestMLRunSystem):
             "imp1", entities=[Entity("name")], timestamp_key="time_stamp"
         )
         data_set1.add_aggregation(
-            "datas", "data", ["avg", "max"], "1h",
+            "data", ["avg", "max"], "1h",
         )
         fs.ingest(data_set1, data, infer_options=fs.InferOptions.default())
 
@@ -1772,36 +2030,50 @@ class TestFeatureStore(TestMLRunSystem):
         data_set2 = fs.FeatureSet("imp2", entities=[Entity("name")])
         fs.ingest(data_set2, data2, infer_options=fs.InferOptions.default())
 
-        features = ["imp1.datas_avg_1h", "imp1.datas_max_1h", "imp2.data2"]
+        features = ["imp2.data2", "imp1.data_max_1h", "imp1.data_avg_1h"]
 
         # create vector and online service with imputing policy
         vector = fs.FeatureVector("vectori", features)
         svc = fs.get_online_feature_service(
-            vector, impute_policy={"*": "$max", "datas_avg_1h": "$mean", "data2": 4}
+            vector, impute_policy={"*": "$max", "data_avg_1h": "$mean", "data2": 4}
         )
         print(svc.vector.status.to_yaml())
 
         resp = svc.get([{"name": "ab"}])
         assert resp[0]["data2"] == 1
-        assert resp[0]["datas_max_1h"] == 60
-        assert resp[0]["datas_avg_1h"] == 30
+        assert resp[0]["data_max_1h"] == 60
+        assert resp[0]["data_avg_1h"] == 30
+
+        # test as list
+        resp = svc.get([{"name": "ab"}], as_list=True)
+        assert resp == [[1, 60, 30]]
+
+        # test with missing key
+        resp = svc.get([{"name": "xx"}])
+        assert resp == [None]
+
+        # test with missing key, as list
+        resp = svc.get([{"name": "xx"}], as_list=True)
+        assert resp == [None]
 
         resp = svc.get([{"name": "cd"}])
         assert resp[0]["data2"] == 4
-        assert resp[0]["datas_max_1h"] == 60
-        assert resp[0]["datas_avg_1h"] == 30
+        assert resp[0]["data_max_1h"] == 60
+        assert resp[0]["data_avg_1h"] == 30
 
         resp = svc.get([{"name": "ef"}])
         assert resp[0]["data2"] == 4
-        assert resp[0]["datas_max_1h"] == 60
-        assert resp[0]["datas_avg_1h"] == 30
+        assert resp[0]["data_max_1h"] == 60
+        assert resp[0]["data_avg_1h"] == 30
+        svc.close()
 
         # check without impute
         vector = fs.FeatureVector("vectori2", features)
         svc = fs.get_online_feature_service(vector)
         resp = svc.get([{"name": "cd"}])
         assert np.isnan(resp[0]["data2"])
-        assert np.isnan(resp[0]["datas_avg_1h"])
+        assert np.isnan(resp[0]["data_avg_1h"])
+        svc.close()
 
 
 def verify_purge(fset, targets):

@@ -4,9 +4,13 @@ import os
 import pathlib
 import typing
 
+import dateutil.parser
+import pymysql.err
+import sqlalchemy.exc
 import sqlalchemy.orm
 
 import mlrun.api.db.sqldb.db
+import mlrun.api.db.sqldb.helpers
 import mlrun.api.db.sqldb.models
 import mlrun.api.schemas
 import mlrun.artifacts
@@ -20,9 +24,91 @@ from .utils.db.mysql import MySQLUtil
 from .utils.db.sqlite_migration import SQLiteMigrationUtil
 
 
-def init_data(from_scratch: bool = False) -> None:
-    logger.info("Creating initial data")
+def init_data(
+    from_scratch: bool = False, perform_migrations_if_needed: bool = False
+) -> None:
+    MySQLUtil.wait_for_db_liveness(logger)
 
+    sqlite_migration_util = None
+    if not from_scratch and config.httpdb.db.database_migration_mode == "enabled":
+        sqlite_migration_util = SQLiteMigrationUtil()
+    alembic_util = _create_alembic_util()
+    is_migration_needed = _is_migration_needed(alembic_util, sqlite_migration_util)
+    if not from_scratch and not perform_migrations_if_needed and is_migration_needed:
+        state = mlrun.api.schemas.APIStates.waiting_for_migrations
+        logger.info("Migration is needed, changing API state", state=state)
+        config.httpdb.state = state
+        return
+
+    logger.info("Creating initial data")
+    config.httpdb.state = mlrun.api.schemas.APIStates.migrations_in_progress
+
+    try:
+        _perform_schema_migrations(alembic_util)
+
+        _perform_database_migration(sqlite_migration_util)
+
+        db_session = create_session()
+        try:
+            init_db(db_session)
+            _add_initial_data(db_session)
+            _perform_data_migrations(db_session)
+        finally:
+            close_session(db_session)
+    except Exception:
+        state = mlrun.api.schemas.APIStates.migrations_failed
+        logger.warning("Migrations failed, changing API state", state=state)
+        config.httpdb.state = state
+        raise
+    # if the above process actually ran a migration - initializations that were skipped on the API initialization
+    # should happen - we can't do it here because it requires an asyncio loop which can't be accessible here
+    # therefore moving to migration_completed state, and other component will take care of moving to online
+    if is_migration_needed:
+        config.httpdb.state = mlrun.api.schemas.APIStates.migrations_completed
+    else:
+        config.httpdb.state = mlrun.api.schemas.APIStates.online
+    logger.info("Initial data created")
+
+
+# If the data_table version doesn't exist, we can assume the data version is 1.
+# This is because data version 1 points to to a data migration which was added back in 0.6.0, and
+# upgrading from a version earlier than 0.6.0 to v>=0.8.0 is not supported.
+data_version_prior_to_table_addition = 1
+latest_data_version = 2
+
+
+def _is_migration_needed(
+    alembic_util: AlembicUtil,
+    sqlite_migration_util: typing.Optional[SQLiteMigrationUtil],
+) -> bool:
+    is_database_migration_needed = False
+    if sqlite_migration_util is not None:
+        is_database_migration_needed = (
+            sqlite_migration_util.is_database_migration_needed()
+        )
+    is_migration_from_scratch = alembic_util.is_migration_from_scratch()
+    is_schema_migration_needed = alembic_util.is_schema_migration_needed()
+    is_data_migration_needed = (
+        not _is_latest_data_version()
+        and config.httpdb.db.data_migrations_mode == "enabled"
+    )
+    is_migration_needed = is_database_migration_needed or (
+        not is_migration_from_scratch
+        and (is_schema_migration_needed or is_data_migration_needed)
+    )
+    logger.info(
+        "Checking if migration is needed",
+        is_migration_from_scratch=is_migration_from_scratch,
+        is_schema_migration_needed=is_schema_migration_needed,
+        is_data_migration_needed=is_data_migration_needed,
+        is_database_migration_needed=is_database_migration_needed,
+        is_migration_needed=is_migration_needed,
+    )
+
+    return is_migration_needed
+
+
+def _create_alembic_util() -> AlembicUtil:
     alembic_config_file_name = "alembic.ini"
     if MySQLUtil.get_mysql_dsn_data():
         alembic_config_file_name = "alembic_mysql.ini"
@@ -31,36 +117,64 @@ def init_data(from_scratch: bool = False) -> None:
     dir_path = pathlib.Path(os.path.dirname(os.path.realpath(__file__)))
     alembic_config_path = dir_path / alembic_config_file_name
 
-    alembic_util = AlembicUtil(alembic_config_path)
-    alembic_util.init_alembic(from_scratch=from_scratch)
+    alembic_util = AlembicUtil(alembic_config_path, _is_latest_data_version())
+    return alembic_util
 
-    if not from_scratch:
-        sqlite_migration_util = SQLiteMigrationUtil()
-        sqlite_migration_util.transfer()
 
+def _perform_schema_migrations(alembic_util: AlembicUtil):
+    logger.info("Performing schema migration")
+    alembic_util.init_alembic(config.httpdb.db.database_backup_mode == "enabled")
+
+
+def _is_latest_data_version():
     db_session = create_session()
+    db = mlrun.api.db.sqldb.db.SQLDB("")
+
     try:
-        init_db(db_session)
-        _perform_data_migrations(db_session)
+        current_data_version = _resolve_current_data_version(db, db_session)
     finally:
         close_session(db_session)
-    logger.info("Initial data created")
+
+    return current_data_version == latest_data_version
+
+
+def _perform_database_migration(
+    sqlite_migration_util: typing.Optional[SQLiteMigrationUtil],
+):
+    if sqlite_migration_util:
+        logger.info("Performing database migration")
+        sqlite_migration_util.transfer()
 
 
 def _perform_data_migrations(db_session: sqlalchemy.orm.Session):
     if config.httpdb.db.data_migrations_mode == "enabled":
         # FileDB is not really a thing anymore, so using SQLDB directly
         db = mlrun.api.db.sqldb.db.SQLDB("")
-        logger.info("Performing data migrations")
-        _fill_project_state(db, db_session)
-        _fix_artifact_tags_duplications(db, db_session)
-        _fix_datasets_large_previews(db, db_session)
-        _add_default_marketplace_source_if_needed(db, db_session)
+        current_data_version = int(db.get_current_data_version(db_session))
+        if current_data_version != latest_data_version:
+            logger.info(
+                "Performing data migrations",
+                current_data_version=current_data_version,
+                latest_data_version=latest_data_version,
+            )
+            if current_data_version < 1:
+                _perform_version_1_data_migrations(db, db_session)
+            if current_data_version < 2:
+                _perform_version_2_data_migrations(db, db_session)
+            db.create_data_version(db_session, str(latest_data_version))
+
+
+def _add_initial_data(db_session: sqlalchemy.orm.Session):
+    # FileDB is not really a thing anymore, so using SQLDB directly
+    db = mlrun.api.db.sqldb.db.SQLDB("")
+    _add_default_marketplace_source_if_needed(db, db_session)
+    _add_data_version(db, db_session)
 
 
 def _fix_datasets_large_previews(
     db: mlrun.api.db.sqldb.db.SQLDB, db_session: sqlalchemy.orm.Session,
 ):
+    logger.info("Fixing datasets large previews")
     # get all artifacts
     artifacts = db._find_artifacts(db_session, None, "*")
     for artifact in artifacts:
@@ -140,6 +254,7 @@ def _fix_datasets_large_previews(
 def _fix_artifact_tags_duplications(
     db: mlrun.api.db.sqldb.db.SQLDB, db_session: sqlalchemy.orm.Session
 ):
+    logger.info("Fixing artifact tags duplications")
     # get all artifacts
     artifacts = db._find_artifacts(db_session, None, "*")
     # get all artifact tags
@@ -220,9 +335,65 @@ def _find_last_updated_artifact(
     return last_updated_artifact
 
 
-def _fill_project_state(
+def _perform_version_2_data_migrations(
     db: mlrun.api.db.sqldb.db.SQLDB, db_session: sqlalchemy.orm.Session
 ):
+    _align_runs_table(db, db_session)
+
+
+def _align_runs_table(
+    db: mlrun.api.db.sqldb.db.SQLDB, db_session: sqlalchemy.orm.Session
+):
+    logger.info("Aligning runs")
+    runs = db._find_runs(db_session, None, "*", None).all()
+    for run in runs:
+        run_dict = run.struct
+
+        # Align run start_time column to the start time from the body
+        run.start_time = (
+            mlrun.api.db.sqldb.helpers.run_start_time(run_dict) or run.start_time
+        )
+        # in case no start time was in the body, we took the time from thecolumn, let's make sure the body will have it
+        # as well
+        run_dict.setdefault("status", {})["start_time"] = (
+            db._add_utc_timezone(run.start_time).isoformat() if run.start_time else None
+        )
+
+        # New name column added, fill it up from the body
+        run.name = run_dict.get("metadata", {}).get("name", "no-name")
+        # in case no name was in the body, we defaulted to "no-name", let's make sure the body will have it as well
+        run_dict.setdefault("metadata", {})["name"] = run.name
+
+        # State field used to have a bug causing only the body to be updated, align the column
+        run.state = run_dict.get("status", {}).get(
+            "state", mlrun.runtimes.constants.RunStates.created
+        )
+        # in case no name was in the body, we defaulted to created, let's make sure the body will have it as well
+        run_dict.setdefault("status", {})["state"] = run.state
+
+        # New updated column added, fill it up from the body
+        updated = datetime.datetime.now(tz=datetime.timezone.utc)
+        if run_dict.get("status", {}).get("last_update"):
+            updated = dateutil.parser.parse(
+                run_dict.get("status", {}).get("last_update")
+            )
+        db._update_run_updated_time(run, run_dict, updated)
+        run.struct = run_dict
+        db._upsert(db_session, run, ignore=True)
+
+
+def _perform_version_1_data_migrations(
+    db: mlrun.api.db.sqldb.db.SQLDB, db_session: sqlalchemy.orm.Session
+):
+    _enrich_project_state(db, db_session)
+    _fix_artifact_tags_duplications(db, db_session)
+    _fix_datasets_large_previews(db, db_session)
+
+
+def _enrich_project_state(
+    db: mlrun.api.db.sqldb.db.SQLDB, db_session: sqlalchemy.orm.Session
+):
+    logger.info("Enriching projects state")
     projects = db.list_projects(db_session)
     for project in projects.projects:
         changed = False
@@ -267,6 +438,67 @@ def _add_default_marketplace_source_if_needed(
         else:
             logger.info("Not adding default marketplace source, per configuration")
     return
+
+
+def _add_data_version(
+    db: mlrun.api.db.sqldb.db.SQLDB, db_session: sqlalchemy.orm.Session
+):
+    if db.get_current_data_version(db_session, raise_on_not_found=False) is None:
+        data_version = _resolve_current_data_version(db, db_session)
+        logger.info(
+            "No data version, setting data version", data_version=data_version,
+        )
+        db.create_data_version(db_session, data_version)
+
+
+def _resolve_current_data_version(
+    db: mlrun.api.db.sqldb.db.SQLDB, db_session: sqlalchemy.orm.Session
+):
+    try:
+        return int(db.get_current_data_version(db_session))
+    except (
+        sqlalchemy.exc.ProgrammingError,
+        sqlalchemy.exc.OperationalError,
+        pymysql.err.ProgrammingError,
+        pymysql.err.OperationalError,
+        mlrun.errors.MLRunNotFoundError,
+    ) as exc:
+        try:
+            projects = db.list_projects(db_session)
+        except (
+            sqlalchemy.exc.ProgrammingError,
+            sqlalchemy.exc.OperationalError,
+            pymysql.err.ProgrammingError,
+            pymysql.err.OperationalError,
+        ):
+            projects = None
+
+        # heuristic - if there are no projects it's a new DB - data version is latest
+        if not projects or not projects.projects:
+            logger.info(
+                "No projects in DB, assuming latest data version",
+                exc=exc,
+                latest_data_version=latest_data_version,
+            )
+            return latest_data_version
+        elif "no such table" in str(exc) or (
+            "Table" in str(exc) and "doesn't exist" in str(exc)
+        ):
+            logger.info(
+                "Data version table does not exist, assuming prior version",
+                exc=exc,
+                data_version_prior_to_table_addition=data_version_prior_to_table_addition,
+            )
+            return data_version_prior_to_table_addition
+        elif isinstance(exc, mlrun.errors.MLRunNotFoundError):
+            logger.info(
+                "Data version table exist without version, assuming prior version",
+                exc=exc,
+                data_version_prior_to_table_addition=data_version_prior_to_table_addition,
+            )
+            return data_version_prior_to_table_addition
+
+        raise exc
 
 
 def main() -> None:

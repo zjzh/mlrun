@@ -14,6 +14,7 @@ import mlrun.api.utils.singletons.db
 import mlrun.api.utils.singletons.project_member
 import mlrun.config
 import mlrun.errors
+import tests.api.conftest
 from mlrun.utils import logger
 
 
@@ -24,7 +25,6 @@ async def projects_follower() -> typing.Generator[
     logger.info("Creating projects follower")
     mlrun.config.config.httpdb.projects.leader = "nop"
     mlrun.config.config.httpdb.projects.periodic_sync_interval = "0 seconds"
-    mlrun.config.config.httpdb.projects.follower_projects_store_mode = "cache"
     mlrun.api.utils.singletons.project_member.initialize_project_member()
     projects_follower = mlrun.api.utils.singletons.project_member.get_project_member()
     yield projects_follower
@@ -138,6 +138,7 @@ def test_delete_project(
     db: sqlalchemy.orm.Session,
     projects_follower: mlrun.api.utils.projects.follower.Member,
     nop_leader: mlrun.api.utils.projects.remotes.leader.Member,
+    k8s_secrets_mock: tests.api.conftest.K8sSecretsMock,
 ):
     project = _generate_project()
     projects_follower.create_project(
@@ -297,7 +298,7 @@ async def test_list_project_summaries(
     project = _generate_project(name="name-1")
     project_summary = mlrun.api.schemas.ProjectSummary(
         name=project.metadata.name,
-        functions_count=4,
+        files_count=4,
         feature_sets_count=5,
         models_count=6,
         runs_failed_recent_count=7,

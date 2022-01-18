@@ -1,7 +1,6 @@
 import base64
 import json
 import os
-import unittest.mock
 
 import deepdiff
 import pytest
@@ -9,12 +8,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 import mlrun.errors
-from mlrun.api.utils.singletons.k8s import get_k8s
 from mlrun.config import config as mlconf
 from mlrun.platforms import auto_mount
 from mlrun.runtimes.kubejob import KubejobRuntime
 from mlrun.runtimes.utils import generate_resources
-from mlrun.secrets import SecretsStore
+from tests.api.conftest import K8sSecretsMock
 from tests.api.runtimes.base import TestRuntimeBase
 
 
@@ -194,16 +192,11 @@ class TestKubejobRuntime(TestRuntimeBase):
         self._assert_pod_creation_config()
         self._assert_pvc_mount_configured(pvc_name, pvc_mount_path, volume_name)
 
-    def test_run_with_k8s_secrets(self, db: Session, client: TestClient):
-        project_secret_name = "dummy_secret_name"
-        secret_keys = ["secret1", "secret2", "secret3"]
+    def test_run_with_k8s_secrets(self, db: Session, k8s_secrets_mock: K8sSecretsMock):
+        secret_keys = ["secret1", "secret2", "secret3", "mlrun.internal_secret"]
+        secrets = {key: "some-secret-value" for key in secret_keys}
 
-        # Need to do some mocking, so code thinks that the secret contains these keys. Otherwise it will not add
-        # the env. variables to the pod spec.
-        get_k8s().get_project_secret_name = unittest.mock.Mock(
-            return_value=project_secret_name
-        )
-        get_k8s().get_project_secret_keys = unittest.mock.Mock(return_value=secret_keys)
+        k8s_secrets_mock.store_project_secrets(self.project, secrets)
 
         runtime = self._generate_runtime()
 
@@ -215,17 +208,26 @@ class TestKubejobRuntime(TestRuntimeBase):
         }
         task.with_secrets(secret_source["kind"], secret_keys)
 
-        # What we expect in this case is that environment variables will be added to the pod which get their
-        # value from the k8s secret, using the correct keys.
-        expected_env_from_secrets = {}
-        for key in secret_keys:
-            env_variable_name = SecretsStore.k8s_env_variable_name_for_secret(key)
-            expected_env_from_secrets[env_variable_name] = {project_secret_name: key}
-
         self._execute_run(runtime, runspec=task)
+
+        # We don't expect the internal secret to be visible - the user cannot mount it to the function
+        # even if specifically asking for it in with_secrets()
+        expected_env_from_secrets = k8s_secrets_mock.get_expected_env_variables_from_secrets(
+            self.project, include_internal=False
+        )
 
         self._assert_pod_creation_config(
             expected_secrets=secret_source,
+            expected_env_from_secrets=expected_env_from_secrets,
+        )
+
+        # Now do the same with auto-mounting of project-secrets, validate internal secret is not visible
+        runtime = self._generate_runtime()
+        task = self._generate_task()
+        task.metadata.project = self.project
+
+        self._execute_run(runtime, runspec=task)
+        self._assert_pod_creation_config(
             expected_env_from_secrets=expected_env_from_secrets,
         )
 

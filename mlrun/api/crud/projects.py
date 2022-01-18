@@ -8,9 +8,11 @@ import humanfriendly
 import sqlalchemy.orm
 
 import mlrun.api.crud
+import mlrun.api.db.session
 import mlrun.api.schemas
 import mlrun.api.utils.projects.remotes.follower
 import mlrun.api.utils.singletons.db
+import mlrun.api.utils.singletons.k8s
 import mlrun.api.utils.singletons.scheduler
 import mlrun.errors
 import mlrun.utils.singleton
@@ -84,6 +86,7 @@ class Projects(
             mlrun.api.utils.singletons.db.get_db().verify_project_has_no_related_resources(
                 session, name
             )
+            self._verify_project_has_no_external_resources(name)
             if deletion_strategy == mlrun.api.schemas.DeletionStrategy.check:
                 return
         elif deletion_strategy.is_cascading():
@@ -94,19 +97,34 @@ class Projects(
             )
         projects_store.delete_project(session, name, deletion_strategy)
 
+    def _verify_project_has_no_external_resources(self, project: str):
+        # Resources which are not tracked in the MLRun DB need to be verified here. Currently these are project
+        # secrets and model endpoints.
+        mlrun.api.crud.ModelEndpoints().verify_project_has_no_model_endpoints(project)
+
+        # Note: this check lists also internal secrets. The assumption is that any internal secret that relate to
+        # an MLRun resource (such as model-endpoints) was already verified in previous checks. Therefore, any internal
+        # secret existing here is something that the user needs to be notified about, as MLRun didn't generate it.
+        # Therefore, this check should remain at the end of the verification flow.
+        if mlrun.api.utils.singletons.k8s.get_k8s().get_project_secret_keys(project):
+            raise mlrun.errors.MLRunPreconditionFailedError(
+                f"Project {project} can not be deleted since related resources found: project secrets"
+            )
+
     def delete_project_resources(
         self, session: sqlalchemy.orm.Session, name: str,
     ):
+        # Delete schedules before runtime resources - otherwise they will keep getting created
+        mlrun.api.utils.singletons.scheduler.get_scheduler().delete_schedules(
+            session, name
+        )
+
         # delete runtime resources
         mlrun.api.crud.RuntimeResources().delete_runtime_resources(
             session, label_selector=f"mlrun/project={name}", force=True,
         )
 
         mlrun.api.crud.Logs().delete_logs(name)
-
-        mlrun.api.utils.singletons.scheduler.get_scheduler().delete_schedules(
-            session, name
-        )
 
         # delete db resources
         mlrun.api.utils.singletons.db.get_db().delete_project_related_resources(
@@ -115,6 +133,9 @@ class Projects(
 
         # delete model monitoring resources
         mlrun.api.crud.ModelEndpoints().delete_model_endpoints_resources(name)
+
+        # delete project secrets - passing None will delete all secrets
+        mlrun.api.utils.singletons.k8s.get_k8s().delete_project_secrets(name, None)
 
     def get_project(
         self, session: sqlalchemy.orm.Session, name: str
@@ -152,7 +173,7 @@ class Projects(
             names,
         )
         project_summaries = await self.generate_projects_summaries(
-            session, projects_output.projects
+            projects_output.projects
         )
         return mlrun.api.schemas.ProjectSummariesOutput(
             project_summaries=project_summaries
@@ -163,27 +184,27 @@ class Projects(
     ) -> mlrun.api.schemas.ProjectSummary:
         # Call get project so we'll explode if project doesn't exists
         await fastapi.concurrency.run_in_threadpool(self.get_project, session, name)
-        project_summaries = await self.generate_projects_summaries(session, [name])
+        project_summaries = await self.generate_projects_summaries([name])
         return project_summaries[0]
 
     async def generate_projects_summaries(
-        self, session: sqlalchemy.orm.Session, projects: typing.List[str]
+        self, projects: typing.List[str]
     ) -> typing.List[mlrun.api.schemas.ProjectSummary]:
         (
-            project_to_function_count,
+            project_to_files_count,
             project_to_schedule_count,
             project_to_feature_set_count,
             project_to_models_count,
             project_to_recent_failed_runs_count,
             project_to_running_runs_count,
             project_to_running_pipelines_count,
-        ) = await self._get_project_resources_counters(session)
+        ) = await self._get_project_resources_counters()
         project_summaries = []
         for project in projects:
             project_summaries.append(
                 mlrun.api.schemas.ProjectSummary(
                     name=project,
-                    functions_count=project_to_function_count.get(project, 0),
+                    files_count=project_to_files_count.get(project, 0),
                     schedules_count=project_to_schedule_count.get(project, 0),
                     feature_sets_count=project_to_feature_set_count.get(project, 0),
                     models_count=project_to_models_count.get(project, 0),
@@ -199,7 +220,7 @@ class Projects(
         return project_summaries
 
     async def _get_project_resources_counters(
-        self, session: sqlalchemy.orm.Session
+        self,
     ) -> typing.Tuple[
         typing.Dict[str, int],
         typing.Dict[str, int],
@@ -220,13 +241,11 @@ class Projects(
             )
 
             results = await asyncio.gather(
-                mlrun.api.utils.singletons.db.get_db().get_project_resources_counters(
-                    session
-                ),
-                self._calculate_pipelines_counters(session),
+                mlrun.api.utils.singletons.db.get_db().get_project_resources_counters(),
+                self._calculate_pipelines_counters(),
             )
             (
-                project_to_function_count,
+                project_to_files_count,
                 project_to_schedule_count,
                 project_to_feature_set_count,
                 project_to_models_count,
@@ -235,7 +254,7 @@ class Projects(
             ) = results[0]
             project_to_running_pipelines_count = results[1]
             self._cache["project_resources_counters"]["result"] = (
-                project_to_function_count,
+                project_to_files_count,
                 project_to_schedule_count,
                 project_to_feature_set_count,
                 project_to_models_count,
@@ -251,14 +270,14 @@ class Projects(
             self._cache["project_resources_counters"]["ttl"] = ttl_time
         return self._cache["project_resources_counters"]["result"]
 
-    async def _calculate_pipelines_counters(
-        self, session: sqlalchemy.orm.Session,
-    ) -> typing.Dict[str, int]:
+    async def _calculate_pipelines_counters(self,) -> typing.Dict[str, int]:
+        def _list_pipelines(session):
+            return mlrun.api.crud.Pipelines().list_pipelines(
+                session, "*", format_=mlrun.api.schemas.PipelinesFormat.metadata_only
+            )
+
         _, _, pipelines = await fastapi.concurrency.run_in_threadpool(
-            mlrun.api.crud.Pipelines().list_pipelines,
-            session,
-            "*",
-            format_=mlrun.api.schemas.PipelinesFormat.metadata_only,
+            mlrun.api.db.session.run_function_with_new_db_session, _list_pipelines,
         )
         project_to_running_pipelines_count = collections.defaultdict(int)
         for pipeline in pipelines:

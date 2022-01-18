@@ -26,12 +26,14 @@ import binascii
 import copy
 import json
 import os
+import typing
 import urllib.parse
 from collections.abc import Mapping
 from distutils.util import strtobool
 from os.path import expanduser
 from threading import Lock
 
+import semver
 import yaml
 
 env_prefix = "MLRUN_"
@@ -50,6 +52,7 @@ default_config = {
     "nest_asyncio_enabled": "",  # enable import of nest_asyncio for corner cases with old jupyter, set "1"
     "ui_url": "",  # remote/external mlrun UI url (for hyperlinks) (This is deprecated in favor of the ui block)
     "remote_host": "",
+    "api_base_version": "v1",
     "version": "",  # will be set to current version
     "images_tag": "",  # tag to use with mlrun images e.g. mlrun/mlrun (defaults to version)
     "images_registry": "",  # registry to use with mlrun images e.g. quay.io/ (defaults to empty, for dockerhub)
@@ -100,6 +103,12 @@ default_config = {
     "default_function_priority_class_name": "",
     # valid options for priority classes - separated by a comma
     "valid_function_priority_class_names": "",
+    # default path prefix for demo data and models
+    "default_samples_path": "https://s3.wasabisys.com/iguazio/",
+    # default path for tensorboard logs
+    "default_tensorboard_logs_path": "/User/.tensorboard/{{project}}",
+    # ";" separated list of notebook cell tag names to ignore e.g. "ignore-this;ignore-that"
+    "ignored_notebook_tags": "",
     "function_defaults": {
         "image_by_kind": {
             "job": "mlrun/mlrun",
@@ -124,11 +133,19 @@ default_config = {
         "real_path": "",
         "db_type": "sqldb",
         "max_workers": "",
+        # See mlrun.api.schemas.APIStates for options
+        "state": "online",
         "db": {
             "commit_retry_timeout": 30,
             "commit_retry_interval": 3,
             # Whether to perform data migrations on initialization. enabled or disabled
             "data_migrations_mode": "enabled",
+            # Whether or not to perform database migration from sqlite to mysql on initialization
+            "database_migration_mode": "enabled",
+            # Whether or not to use db backups on initialization
+            "database_backup_mode": "enabled",
+            "connections_pool_size": 20,
+            "connections_pool_max_overflow": 50,
         },
         "jobs": {
             # whether to allow to run local runtimes in the API - configurable to allow the scheduler testing to work
@@ -179,8 +196,6 @@ default_config = {
             # misfire_grace_time is 1 second, we do not want jobs not being scheduled because of the delays so setting
             # it to None. the default for coalesce it True just adding it here to be explicit
             "scheduler_config": '{"job_defaults": {"misfire_grace_time": null, "coalesce": true}}',
-            # one of enabled, disabled, auto (in which it will be determined by whether the authorization mode is opa)
-            "schedule_credentials_secrets_store_mode": "auto",
         },
         "projects": {
             "leader": "mlrun",
@@ -190,11 +205,7 @@ default_config = {
             "counters_cache_ttl": "2 minutes",
             # access key to be used when the leader is iguazio and polling is done from it
             "iguazio_access_key": "",
-            # the initial implementation was cache and was working great, now it's not needed because we get (read/list)
-            # from leader because of some auth restriction, we will probably go back to it at some point since it's
-            # better performance wise, so made it a mode
-            # one of: cache, none
-            "follower_projects_store_mode": "cache",
+            "iguazio_list_projects_default_page_size": 200,
             "project_owners_cache_ttl": "30 seconds",
         },
         # The API needs to know what is its k8s svc url so it could enrich it in the jobs it creates
@@ -208,10 +219,13 @@ default_config = {
             # pip install <requirement_specifier>, e.g. mlrun==0.5.4, mlrun~=0.5,
             # git+https://github.com/mlrun/mlrun@development. by default uses the version
             "mlrun_version_specifier": "",
-            "kaniko_image": "gcr.io/kaniko-project/executor:v0.24.0",  # kaniko builder image
+            "kaniko_image": "gcr.io/kaniko-project/executor:v1.6.0",  # kaniko builder image
             "kaniko_init_container_image": "alpine:3.13.1",
             # additional docker build args in json encoded base64 format
             "build_args": "",
+            "pip_ca_secret_name": "",
+            "pip_ca_secret_key": "",
+            "pip_ca_path": "/etc/ssl/certs/mlrun/pip-ca-certificates.crt",
         },
         "v3io_api": "",
         "v3io_framesd": "",
@@ -224,6 +238,7 @@ default_config = {
             "user_space": "v3io:///projects/{project}/model-endpoints/{kind}",
         },
         "batch_processing_function_branch": "master",
+        "parquet_batching_max_events": 10000,
     },
     "secret_stores": {
         "vault": {
@@ -348,6 +363,14 @@ class Config:
         return build_args
 
     @staticmethod
+    def is_pip_ca_configured():
+        return (
+            config.httpdb.builder.pip_ca_secret_name
+            and config.httpdb.builder.pip_ca_secret_key
+            and config.httpdb.builder.pip_ca_path
+        )
+
+    @staticmethod
     def get_hub_url():
         if not config.hub_url.endswith("function.yaml"):
             if config.hub_url.startswith("http"):
@@ -383,6 +406,19 @@ class Config:
             if priority_class_name not in valid_function_priority_class_names:
                 valid_function_priority_class_names.append(priority_class_name)
         return valid_function_priority_class_names
+
+    @staticmethod
+    def get_parsed_igz_version() -> typing.Optional[semver.VersionInfo]:
+        if not config.igz_version:
+            return None
+        try:
+            parsed_version = semver.VersionInfo.parse(config.igz_version)
+            return parsed_version
+        except ValueError:
+            # iguazio version is semver compatible only from 3.2, before that it will be something
+            # like 3.0_b177_20210806003728
+            semver_compatible_igz_version = config.igz_version.split("_")[0]
+            return semver.VersionInfo.parse(f"{semver_compatible_igz_version}.0")
 
     @staticmethod
     def get_storage_auto_mount_params():

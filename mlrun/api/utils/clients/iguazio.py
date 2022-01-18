@@ -5,7 +5,6 @@ import json
 import typing
 import urllib.parse
 
-import deepdiff
 import fastapi
 import requests.adapters
 import urllib3
@@ -134,30 +133,21 @@ class Client(
                 SessionPlanes.data,
                 SessionPlanes.control,
             ]
-
-        response = self._send_request_to_api(
-            "GET", "access_keys", "Failed getting access keys from Iguazio", session,
-        )
-        response_body = response.json()
-        for access_key in response_body.get("data", []):
-            access_key_planes = access_key.get("attributes", {}).get("planes", [])
-            if deepdiff.DeepDiff(planes, access_key_planes, ignore_order=True,) == {}:
-                return access_key["id"]
-        # If we're here we couldn't find an existing access key with the requested planes, so let's create one
         body = {
             "data": {
                 "type": "access_key",
                 "attributes": {"label": "MLRun", "planes": planes},
             }
         }
-        logger.debug("Creating access key in Iguazio", planes=planes)
         response = self._send_request_to_api(
             "POST",
-            "access_keys",
-            "Failed verifying iguazio session",
+            "self/get_or_create_access_key",
+            "Failed getting or creating iguazio access key",
             session,
             json=body,
         )
+        if response.status_code == http.HTTPStatus.CREATED.value:
+            logger.debug("Created access key in Iguazio", planes=planes)
         return response.json()["data"]["id"]
 
     def create_project(
@@ -165,28 +155,17 @@ class Client(
         session: str,
         project: mlrun.api.schemas.Project,
         wait_for_completion: bool = True,
-    ) -> typing.Tuple[mlrun.api.schemas.Project, bool]:
+    ) -> bool:
         logger.debug("Creating project in Iguazio", project=project)
         body = self._transform_mlrun_project_to_iguazio_project(project)
         return self._create_project_in_iguazio(session, body, wait_for_completion)
 
-    def store_project(
-        self,
-        session: str,
-        name: str,
-        project: mlrun.api.schemas.Project,
-        wait_for_completion: bool = True,
-    ) -> typing.Tuple[mlrun.api.schemas.Project, bool]:
-        logger.debug("Storing project in Iguazio", name=name, project=project)
+    def update_project(
+        self, session: str, name: str, project: mlrun.api.schemas.Project,
+    ):
+        logger.debug("Updating project in Iguazio", name=name, project=project)
         body = self._transform_mlrun_project_to_iguazio_project(project)
-        try:
-            self._get_project_from_iguazio(session, name)
-        except requests.HTTPError as exc:
-            if exc.response.status_code != http.HTTPStatus.NOT_FOUND.value:
-                raise
-            return self._create_project_in_iguazio(session, body, wait_for_completion)
-        else:
-            return self._put_project_to_iguazio(session, name, body), False
+        self._put_project_to_iguazio(session, name, body)
 
     def delete_project(
         self,
@@ -236,7 +215,10 @@ class Client(
             return True
 
     def list_projects(
-        self, session: str, updated_after: typing.Optional[datetime.datetime] = None,
+        self,
+        session: str,
+        updated_after: typing.Optional[datetime.datetime] = None,
+        page_size: typing.Optional[int] = None,
     ) -> typing.Tuple[
         typing.List[mlrun.api.schemas.Project], typing.Optional[datetime.datetime]
     ]:
@@ -244,6 +226,12 @@ class Client(
         if updated_after is not None:
             time_string = updated_after.isoformat().split("+")[0]
             params = {"filter[updated_at]": f"[$gt]{time_string}Z"}
+        if page_size is None:
+            page_size = (
+                mlrun.mlconf.httpdb.projects.iguazio_list_projects_default_page_size
+            )
+        if page_size is not None:
+            params["page[size]"] = int(page_size)
 
         params["include"] = "owner"
         response = self._send_request_to_api(
@@ -298,17 +286,14 @@ class Client(
 
     def _create_project_in_iguazio(
         self, session: str, body: dict, wait_for_completion: bool
-    ) -> typing.Tuple[mlrun.api.schemas.Project, bool]:
-        project, job_id = self._post_project_to_iguazio(session, body)
+    ) -> bool:
+        _, job_id = self._post_project_to_iguazio(session, body)
         if wait_for_completion:
             self._wait_for_job_completion(
                 session, job_id, "Project creation job failed"
             )
-            return (
-                self._get_project_from_iguazio(session, project.metadata.name),
-                False,
-            )
-        return project, True
+            return False
+        return True
 
     def _post_project_to_iguazio(
         self, session: str, body: dict

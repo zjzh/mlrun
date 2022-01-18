@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from copy import deepcopy
 from typing import List, Union
 
 import nuclio
@@ -27,9 +28,10 @@ from ..serving.states import (
     RootFlowStep,
     RouterStep,
     StepKinds,
+    TaskStep,
     graph_root_setter,
-    new_model_endpoint,
     new_remote_endpoint,
+    params_to_step,
 )
 from ..utils import get_caller_globals, logger
 from .function import NuclioSpec, RemoteRuntime
@@ -113,6 +115,10 @@ class ServingSpec(NuclioSpec):
         affinity=None,
         disable_auto_mount=False,
         priority_class_name=None,
+        default_handler=None,
+        pythonpath=None,
+        workdir=None,
+        image_pull_secret=None,
     ):
 
         super().__init__(
@@ -143,6 +149,10 @@ class ServingSpec(NuclioSpec):
             affinity=affinity,
             disable_auto_mount=disable_auto_mount,
             priority_class_name=priority_class_name,
+            default_handler=default_handler,
+            pythonpath=pythonpath,
+            workdir=workdir,
+            image_pull_secret=image_pull_secret,
         )
 
         self.models = models or {}
@@ -196,8 +206,13 @@ class ServingRuntime(RemoteRuntime):
     ) -> Union[RootFlowStep, RouterStep]:
         """set the serving graph topology (router/flow) and root class or params
 
-        example::
+        examples::
 
+            # simple model router topology
+            graph = fn.set_topology("router")
+            fn.add_model(name, class_name="ClassifierModel", model_path=model_uri)
+
+            # async flow topology
             graph = fn.set_topology("flow", engine="async")
             graph.to("MyClass").to(name="to_json", handler="json.dumps").respond()
 
@@ -213,7 +228,7 @@ class ServingRuntime(RemoteRuntime):
                    one which generates the (REST) call response
 
         :param topology:     - graph topology, router or flow
-        :param class_name:   - optional for router, router class name/path
+        :param class_name:   - optional for router, router class name/path or router object
         :param engine:       - optional for flow, sync or async engine (default to async)
         :param exist_ok:     - allow overriding existing topology
         :param class_args:   - optional, router/flow class init args
@@ -227,7 +242,15 @@ class ServingRuntime(RemoteRuntime):
             )
 
         if topology == StepKinds.router:
-            self.spec.graph = RouterStep(class_name=class_name, class_args=class_args)
+            if class_name and hasattr(class_name, "to_dict"):
+                _, step = params_to_step(class_name, None)
+                if step.kind != StepKinds.router:
+                    raise mlrun.errors.MLRunInvalidArgumentError(
+                        "provided class is not a router step, must provide a router class in router topology"
+                    )
+            else:
+                step = RouterStep(class_name=class_name, class_args=class_args)
+            self.spec.graph = step
         elif topology == StepKinds.flow:
             self.spec.graph = RootFlowStep(engine=engine)
         else:
@@ -269,6 +292,7 @@ class ServingRuntime(RemoteRuntime):
         model_url=None,
         handler=None,
         router_step=None,
+        child_function=None,
         **class_args,
     ):
         """add ml model and/or route to the function.
@@ -284,12 +308,13 @@ class ServingRuntime(RemoteRuntime):
 
         :param key:         model api key (or name:version), will determine the relative url/path
         :param model_path:  path to mlrun model artifact or model directory file/object path
-        :param class_name:  V2 Model python class name
+        :param class_name:  V2 Model python class name or a model class instance
                             (can also module.submodule.class and it will be imported automatically)
         :param model_url:   url of a remote model serving endpoint (cannot be used with model_path)
         :param handler:     for advanced users!, override default class handler name (do_event)
         :param router_step: router step name (to determine which router we add the model to in graphs
                             with multiple router steps)
+        :param child_function: child function name, when the model runs in a child function
         :param class_args:  extra kwargs to pass to the model serving class __init__
                             (can be read in the model using .get_param(key) method)
         """
@@ -322,22 +347,31 @@ class ServingRuntime(RemoteRuntime):
                     )
                 graph = routers[0]
 
-        if not model_path and not model_url:
-            raise ValueError("model_path or model_url must be provided")
-        class_name = class_name or self.spec.default_class
-        if class_name and not isinstance(class_name, str):
-            raise ValueError(
-                "class name must be a string (name of module.submodule.name)"
-            )
-        if model_path and not class_name:
-            raise ValueError("model_path must be provided with class_name")
-        if model_path:
-            model_path = str(model_path)
-
-        if model_url:
-            state = new_remote_endpoint(model_url, **class_args)
+        if class_name and hasattr(class_name, "to_dict"):
+            if model_path:
+                class_name.model_path = model_path
+            key, state = params_to_step(class_name, key)
         else:
-            state = new_model_endpoint(class_name, model_path, handler, **class_args)
+            if not model_path and not model_url:
+                raise ValueError("model_path or model_url must be provided")
+            class_name = class_name or self.spec.default_class
+            if class_name and not isinstance(class_name, str):
+                raise ValueError(
+                    "class name must be a string (name of module.submodule.name)"
+                )
+            if model_path and not class_name:
+                raise ValueError("model_path must be provided with class_name")
+            if model_path:
+                model_path = str(model_path)
+
+            if model_url:
+                state = new_remote_endpoint(model_url, **class_args)
+            else:
+                class_args = deepcopy(class_args)
+                class_args["model_path"] = model_path
+                state = TaskStep(
+                    class_name, class_args, handler=handler, function=child_function
+                )
 
         return graph.add_route(key, state)
 
@@ -374,8 +408,9 @@ class ServingRuntime(RemoteRuntime):
                 group = stream.options.get("group", "serving")
 
                 child_function = self._spec.function_refs[function_name]
+                trigger_args = stream.trigger_args or {}
                 child_function.function_object.add_v3io_stream_trigger(
-                    stream.path, group=group, shards=stream.shards
+                    stream.path, group=group, shards=stream.shards, **trigger_args
                 )
 
     def _deploy_function_refs(self):
@@ -392,7 +427,7 @@ class ServingRuntime(RemoteRuntime):
             function_object.metadata.labels = function_object.metadata.labels or {}
             function_object.metadata.labels[
                 "mlrun/parent-function"
-            ] = self._function_uri()
+            ] = self.metadata.name
             if not function_object.spec.graph:
                 # copy the current graph only if the child doesnt have a graph of his own
                 function_object.set_env("SERVING_CURRENT_FUNCTION", function_ref.name)

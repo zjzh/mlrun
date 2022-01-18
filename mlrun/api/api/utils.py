@@ -10,10 +10,12 @@ from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
+import mlrun.api.crud
 import mlrun.api.utils.auth.verifier
 import mlrun.errors
 from mlrun.api import schemas
 from mlrun.api.db.sqldb.db import SQLDB
+from mlrun.api.schemas import SecretProviderName
 from mlrun.api.utils.singletons.db import get_db
 from mlrun.api.utils.singletons.logs_dir import get_logs_dir
 from mlrun.api.utils.singletons.scheduler import get_scheduler
@@ -133,6 +135,8 @@ def _generate_function_and_task_from_submit_run_body(
     # in the auth_info. If this was triggered by the SDK, then auto-mount was already attempted and will be skipped.
     try_perform_auto_mount(function, auth_info)
 
+    # Validate function's service-account, based on allowed SAs for the project, if existing in a project-secret.
+    process_function_service_account(function)
     return function, task
 
 
@@ -149,24 +153,24 @@ def ensure_function_has_auth_set(function, auth_info: mlrun.api.schemas.AuthInfo
         and function.kind not in mlrun.runtimes.RuntimeKinds.local_runtimes()
         and mlrun.api.utils.auth.verifier.AuthVerifier().is_jobs_auth_required()
     ):
-        if auth_info and auth_info.session:
-            if (
-                function.metadata.credentials.access_key
-                == mlrun.model.Credentials.generate_access_key
-            ):
-                # fmt: off
-                function.metadata.credentials.access_key = mlrun.api.utils.auth.verifier\
-                    .AuthVerifier().get_or_create_access_key(auth_info.session)
-                # fmt: on
-            if not function.metadata.credentials.access_key:
-                raise mlrun.errors.MLRunInvalidArgumentError(
-                    "Function access key must be set (function.metadata.credentials.access_key)"
+        if (
+            function.metadata.credentials.access_key
+            == mlrun.model.Credentials.generate_access_key
+        ):
+            if not auth_info.access_key:
+                auth_info.access_key = mlrun.api.utils.auth.verifier.AuthVerifier().get_or_create_access_key(
+                    auth_info.session
                 )
-            auth_env_vars = {
-                "MLRUN_AUTH_SESSION": function.metadata.credentials.access_key,
-            }
-            for key, value in auth_env_vars.items():
-                function.set_env(key, value)
+            function.metadata.credentials.access_key = auth_info.access_key
+        if not function.metadata.credentials.access_key:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "Function access key must be set (function.metadata.credentials.access_key)"
+            )
+        auth_env_vars = {
+            "MLRUN_AUTH_SESSION": function.metadata.credentials.access_key,
+        }
+        for key, value in auth_env_vars.items():
+            function.set_env(key, value)
 
 
 def try_perform_auto_mount(function, auth_info: mlrun.api.schemas.AuthInfo):
@@ -177,12 +181,50 @@ def try_perform_auto_mount(function, auth_info: mlrun.api.schemas.AuthInfo):
         return
     # Retrieve v3io auth params from the caller auth info
     override_params = {}
-    if auth_info.data_session:
-        override_params["access_key"] = auth_info.data_session
+    if auth_info.data_session or auth_info.access_key:
+        override_params["access_key"] = auth_info.data_session or auth_info.access_key
     if auth_info.username:
         override_params["user"] = auth_info.username
 
     function.try_auto_mount_based_on_config(override_params)
+
+
+def process_function_service_account(function):
+    allowed_service_accounts = mlrun.api.crud.secrets.Secrets().get_secret(
+        function.metadata.project,
+        SecretProviderName.kubernetes,
+        mlrun.api.crud.secrets.Secrets().generate_service_account_secret_key("allowed"),
+        allow_secrets_from_k8s=True,
+        allow_internal_secrets=True,
+    )
+    if allowed_service_accounts:
+        allowed_service_accounts = [
+            service_account.strip()
+            for service_account in allowed_service_accounts.split(",")
+        ]
+
+    default_service_account = mlrun.api.crud.secrets.Secrets().get_secret(
+        function.metadata.project,
+        SecretProviderName.kubernetes,
+        mlrun.api.crud.secrets.Secrets().generate_service_account_secret_key("default"),
+        allow_secrets_from_k8s=True,
+        allow_internal_secrets=True,
+    )
+
+    # Sanity check on project configuration
+    if (
+        default_service_account
+        and allowed_service_accounts
+        and default_service_account not in allowed_service_accounts
+    ):
+        raise mlrun.errors.MLRunInvalidArgumentError(
+            f"Default service account {default_service_account} is not in list of allowed "
+            + f"service accounts {allowed_service_accounts}"
+        )
+
+    function.validate_and_enrich_service_account(
+        allowed_service_accounts, default_service_account
+    )
 
 
 def _submit_run(

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 from typing import List, Optional, Union
 
 import mlrun.api.schemas
@@ -94,6 +95,14 @@ class SQLDB(RunDBInterface):
         sort=True,
         last=0,
         iter=None,
+        start_time_from: datetime.datetime = None,
+        start_time_to: datetime.datetime = None,
+        last_update_time_from: datetime.datetime = None,
+        last_update_time_to: datetime.datetime = None,
+        partition_by: Union[schemas.RunPartitionByField, str] = None,
+        rows_per_partition: int = 1,
+        partition_sort_by: Union[schemas.SortField, str] = None,
+        partition_order: Union[schemas.OrderType, str] = schemas.OrderType.desc,
     ):
         import mlrun.api.crud
 
@@ -104,10 +113,18 @@ class SQLDB(RunDBInterface):
             uid,
             project,
             labels,
-            state,
+            mlrun.utils.helpers.as_list(state) if state is not None else None,
             sort,
             last,
             iter,
+            start_time_from,
+            start_time_to,
+            last_update_time_from,
+            last_update_time_to,
+            partition_by,
+            rows_per_partition,
+            partition_sort_by,
+            partition_order,
         )
 
     def del_run(self, uid, project=None, iter=None):
@@ -166,8 +183,13 @@ class SQLDB(RunDBInterface):
         until=None,
         iter: int = None,
         best_iteration: bool = False,
+        kind: str = None,
+        category: Union[str, schemas.ArtifactCategories] = None,
     ):
         import mlrun.api.crud
+
+        if category and isinstance(category, str):
+            category = schemas.ArtifactCategories(category)
 
         return self._transform_db_error(
             mlrun.api.crud.Artifacts().list_artifacts,
@@ -180,6 +202,8 @@ class SQLDB(RunDBInterface):
             until,
             iter=iter,
             best_iteration=best_iteration,
+            kind=kind,
+            category=category,
         )
 
     def del_artifact(self, key, tag="", project=""):
@@ -571,7 +595,7 @@ class SQLDB(RunDBInterface):
         project: str,
         provider: Union[
             str, mlrun.api.schemas.SecretProviderName
-        ] = mlrun.api.schemas.SecretProviderName.vault,
+        ] = mlrun.api.schemas.SecretProviderName.kubernetes,
         secrets: dict = None,
     ):
         raise NotImplementedError()
@@ -582,7 +606,7 @@ class SQLDB(RunDBInterface):
         token: str,
         provider: Union[
             str, mlrun.api.schemas.SecretProviderName
-        ] = mlrun.api.schemas.SecretProviderName.vault,
+        ] = mlrun.api.schemas.SecretProviderName.kubernetes,
         secrets: List[str] = None,
     ) -> mlrun.api.schemas.SecretsData:
         raise NotImplementedError()
@@ -592,7 +616,7 @@ class SQLDB(RunDBInterface):
         project: str,
         provider: Union[
             str, mlrun.api.schemas.SecretProviderName
-        ] = mlrun.api.schemas.SecretProviderName.vault,
+        ] = mlrun.api.schemas.SecretProviderName.kubernetes,
         token: str = None,
     ) -> mlrun.api.schemas.SecretKeysData:
         raise NotImplementedError()
@@ -602,7 +626,7 @@ class SQLDB(RunDBInterface):
         project: str,
         provider: Union[
             str, mlrun.api.schemas.SecretProviderName
-        ] = mlrun.api.schemas.SecretProviderName.vault,
+        ] = mlrun.api.schemas.SecretProviderName.kubernetes,
         secrets: List[str] = None,
     ):
         raise NotImplementedError()
@@ -700,4 +724,6 @@ class SQLDB(RunDBInterface):
         self,
         authorization_verification_input: mlrun.api.schemas.AuthorizationVerificationInput,
     ):
-        raise NotImplementedError()
+        # on server side authorization is done in endpoint anyway, so for server side we can "pass" on check
+        # done from ingest()
+        pass

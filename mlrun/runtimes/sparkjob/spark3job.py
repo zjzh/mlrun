@@ -56,6 +56,11 @@ class Spark3JobSpec(AbstractSparkJobSpec):
         use_default_image=False,
         priority_class_name=None,
         dynamic_allocation=None,
+        monitoring=None,
+        disable_auto_mount=False,
+        pythonpath=None,
+        node_name=None,
+        affinity=None,
     ):
 
         super().__init__(
@@ -78,6 +83,10 @@ class Spark3JobSpec(AbstractSparkJobSpec):
             build=build,
             node_selector=node_selector,
             priority_class_name=priority_class_name,
+            disable_auto_mount=disable_auto_mount,
+            pythonpath=pythonpath,
+            node_name=node_name,
+            affinity=affinity,
         )
 
         self.driver_resources = driver_resources or {}
@@ -94,6 +103,7 @@ class Spark3JobSpec(AbstractSparkJobSpec):
         self.dynamic_allocation = dynamic_allocation or {}
         self.driver_node_selector = driver_node_selector
         self.executor_node_selector = executor_node_selector
+        self.monitoring = monitoring or {}
 
 
 class Spark3Runtime(AbstractSparkRuntime):
@@ -105,6 +115,21 @@ class Spark3Runtime(AbstractSparkRuntime):
                 self.spec.priority_class_name,
                 str,
             )
+
+        verify_and_update_in(
+            job,
+            "spec.driver.cores",
+            1,  # Must be set due to CRD validations. Will be overridden by coreRequest
+            int,
+        )
+        if "requests" in self.spec.driver_resources:
+            if "cpu" in self.spec.driver_resources["requests"]:
+                verify_and_update_in(
+                    job,
+                    "spec.driver.coreRequest",
+                    str(self.spec.driver_resources["requests"]["cpu"]),
+                    str,
+                )
 
         if self.spec.dynamic_allocation:
             if "enabled" in self.spec.dynamic_allocation:
@@ -139,6 +164,16 @@ class Spark3Runtime(AbstractSparkRuntime):
             update_in(
                 job, "spec.executor.nodeSelector", self.spec.executor_node_selector
             )
+        if self.spec.monitoring:
+            if "enabled" in self.spec.monitoring and self.spec.monitoring["enabled"]:
+                update_in(job, "spec.monitoring.exposeDriverMetrics", True)
+                update_in(job, "spec.monitoring.exposeExecutorMetrics", True)
+                if "exporter_jar" in self.spec.monitoring:
+                    update_in(
+                        job,
+                        "spec.monitoring.prometheus.jmxExporterJar",
+                        self.spec.monitoring["exporter_jar"],
+                    )
         return
 
     def _get_spark_version(self):
@@ -151,6 +186,7 @@ class Spark3Runtime(AbstractSparkRuntime):
                 "local:///spark/v3io-libs/v3io-spark3-streaming_2.12.jar",
                 "local:///spark/v3io-libs/v3io-spark3-object-dataframe_2.12.jar",
                 "local:///igz/java/libs/scala-library-2.12.14.jar",
+                "local:///spark/jars/jmx_prometheus_javaagent-0.16.1.jar",
             ],
             "files": ["local:///igz/java/libs/v3io-pyspark.zip"],
         }
@@ -233,3 +269,19 @@ class Spark3Runtime(AbstractSparkRuntime):
             self.spec.dynamic_allocation["maxExecutors"] = max_executors
         if initial_executors:
             self.spec.dynamic_allocation["initialExecutors"] = initial_executors
+
+    def disable_monitoring(self):
+        self.spec.monitoring["enabled"] = False
+
+    def _with_monitoring(self, enabled=True, exporter_jar=None):
+        self.spec.monitoring["enabled"] = enabled
+        if enabled:
+            if exporter_jar:
+                self.spec.monitoring["exporter_jar"] = exporter_jar
+
+    def with_igz_spark(self):
+        super().with_igz_spark()
+        if "enabled" not in self.spec.monitoring or self.spec.monitoring["enabled"]:
+            self._with_monitoring(
+                exporter_jar="/spark/jars/jmx_prometheus_javaagent-0.16.1.jar",
+            )

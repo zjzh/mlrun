@@ -128,11 +128,19 @@ class FileRunDB(RunDBInterface):
         sort=True,
         last=1000,
         iter=False,
-        start_time_from=None,
-        start_time_to=None,
-        last_update_time_from=None,
-        last_update_time_to=None,
+        start_time_from: datetime = None,
+        start_time_to: datetime = None,
+        last_update_time_from: datetime = None,
+        last_update_time_to: datetime = None,
+        partition_by: Union[schemas.RunPartitionByField, str] = None,
+        rows_per_partition: int = 1,
+        partition_sort_by: Union[schemas.SortField, str] = None,
+        partition_order: Union[schemas.OrderType, str] = schemas.OrderType.desc,
     ):
+        if partition_by is not None:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "Runs partitioning not supported"
+            )
         labels = [] if labels is None else labels
         filepath = self._filepath(run_logs, project)
         results = RunList()
@@ -236,10 +244,12 @@ class FileRunDB(RunDBInterface):
         until=None,
         iter: int = None,
         best_iteration: bool = False,
+        kind: str = None,
+        category: Union[str, schemas.ArtifactCategories] = None,
     ):
-        if iter:
+        if iter or kind or category:
             raise NotImplementedError(
-                "iter parameter not supported for filedb implementation"
+                "iter/kind/category parameters are not supported for filedb implementation"
             )
 
         labels = [] if labels is None else labels
@@ -652,7 +662,7 @@ class FileRunDB(RunDBInterface):
     def create_project_secrets(
         self,
         project: str,
-        provider: str = mlrun.api.schemas.SecretProviderName.vault.value,
+        provider: str = mlrun.api.schemas.SecretProviderName.kubernetes.value,
         secrets: dict = None,
     ):
         raise NotImplementedError()
@@ -661,7 +671,7 @@ class FileRunDB(RunDBInterface):
         self,
         project: str,
         token: str,
-        provider: str = mlrun.api.schemas.SecretProviderName.vault.value,
+        provider: str = mlrun.api.schemas.SecretProviderName.kubernetes.value,
         secrets: List[str] = None,
     ) -> mlrun.api.schemas.SecretsData:
         raise NotImplementedError()
@@ -669,7 +679,7 @@ class FileRunDB(RunDBInterface):
     def list_project_secret_keys(
         self,
         project: str,
-        provider: str = mlrun.api.schemas.SecretProviderName.vault,
+        provider: str = mlrun.api.schemas.SecretProviderName.kubernetes,
         token: str = None,
     ) -> mlrun.api.schemas.SecretKeysData:
         raise NotImplementedError()
@@ -677,7 +687,7 @@ class FileRunDB(RunDBInterface):
     def delete_project_secrets(
         self,
         project: str,
-        provider: str = mlrun.api.schemas.SecretProviderName.vault.value,
+        provider: str = mlrun.api.schemas.SecretProviderName.kubernetes.value,
         secrets: List[str] = None,
     ):
         raise NotImplementedError()

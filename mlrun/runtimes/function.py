@@ -15,6 +15,7 @@
 import asyncio
 import json
 import typing
+import warnings
 from datetime import datetime
 from os import getenv
 from time import sleep
@@ -126,6 +127,9 @@ class NuclioSpec(KubeResourceSpec):
         affinity=None,
         disable_auto_mount=False,
         priority_class_name=None,
+        pythonpath=None,
+        workdir=None,
+        image_pull_secret=None,
     ):
 
         super().__init__(
@@ -149,6 +153,9 @@ class NuclioSpec(KubeResourceSpec):
             affinity=affinity,
             disable_auto_mount=disable_auto_mount,
             priority_class_name=priority_class_name,
+            pythonpath=pythonpath,
+            workdir=workdir,
+            image_pull_secret=image_pull_secret,
         )
 
         self.base_spec = base_spec or ""
@@ -199,8 +206,9 @@ class NuclioStatus(FunctionStatus):
         address=None,
         internal_invocation_urls=None,
         external_invocation_urls=None,
+        build_pod=None,
     ):
-        super().__init__(state)
+        super().__init__(state, build_pod)
 
         self.nuclio_name = nuclio_name
 
@@ -216,6 +224,7 @@ class NuclioStatus(FunctionStatus):
 
 class RemoteRuntime(KubeResource):
     kind = "remote"
+    _is_nested = False
 
     @property
     def spec(self) -> NuclioSpec:
@@ -241,8 +250,14 @@ class RemoteRuntime(KubeResource):
         raise Exception("deprecated, use .apply(mount_v3io())")
 
     def add_trigger(self, name, spec):
+        """add a nuclio trigger object/dict
+
+        :param name: trigger name
+        :param spec: trigger object or dict
+        """
         if hasattr(spec, "to_dict"):
             spec = spec.to_dict()
+        spec["name"] = name
         self.spec.config[f"spec.triggers.{name}"] = spec
         return self
 
@@ -354,6 +369,11 @@ class RemoteRuntime(KubeResource):
         return self
 
     def with_v3io(self, local="", remote=""):
+        """Add v3io volume to the function
+
+        :param local: local path (mount path inside the function container)
+        :param remote: v3io path
+        """
         if local and remote:
             self.apply(mount_v3io(remote=remote, mount_path=local))
         else:
@@ -361,17 +381,80 @@ class RemoteRuntime(KubeResource):
         return self
 
     def with_http(
-        self, workers=8, port=0, host=None, paths=None, canary=None, secret=None
+        self,
+        workers=8,
+        port=0,
+        host=None,
+        paths=None,
+        canary=None,
+        secret=None,
+        worker_timeout: int = None,
+        gateway_timeout: int = None,
+        trigger_name=None,
+        annotations=None,
+        extra_attributes=None,
     ):
-        self.add_trigger(
-            "http",
-            nuclio.HttpTrigger(
-                workers, port=port, host=host, paths=paths, canary=canary, secret=secret
-            ),
+        """update/add nuclio HTTP trigger settings
+
+        Note: gateway timeout is the maximum request time before an error is returned, while the worker timeout
+        if the max time a request will wait for until it will start processing, gateway_timeout must be greater than
+        the worker_timeout.
+
+        :param workers:    number of worker processes (default=8)
+        :param port:       TCP port
+        :param host:       hostname
+        :param paths:      list of sub paths
+        :param canary:     k8s ingress canary (% traffic value between 0 to 100)
+        :param secret:     k8s secret name for SSL certificate
+        :param worker_timeout:  worker wait timeout in sec (how long a message should wait in the worker queue
+                                before an error is returned)
+        :param gateway_timeout: nginx ingress timeout in sec (request timeout, when will the gateway return an error)
+        :param trigger_name:    alternative nuclio trigger name
+        :param annotations:     key/value dict of ingress annotations
+        :param extra_attributes: key/value dict of extra nuclio trigger attributes
+        :return: function object (self)
+        """
+        annotations = annotations or {}
+        if worker_timeout:
+            gateway_timeout = gateway_timeout or (worker_timeout + 60)
+        if gateway_timeout:
+            if worker_timeout and worker_timeout >= gateway_timeout:
+                raise ValueError(
+                    "gateway timeout must be greater than the worker timeout"
+                )
+            annotations[
+                "nginx.ingress.kubernetes.io/proxy-connect-timeout"
+            ] = f"{gateway_timeout}"
+            annotations[
+                "nginx.ingress.kubernetes.io/proxy-read-timeout"
+            ] = f"{gateway_timeout}"
+            annotations[
+                "nginx.ingress.kubernetes.io/proxy-send-timeout"
+            ] = f"{gateway_timeout}"
+
+        trigger = nuclio.HttpTrigger(
+            workers,
+            port=port,
+            host=host,
+            paths=paths,
+            canary=canary,
+            secret=secret,
+            annotations=annotations,
+            extra_attributes=extra_attributes,
         )
+        if worker_timeout:
+            trigger._struct["workerAvailabilityTimeoutMilliseconds"] = (
+                worker_timeout
+            ) * 1000
+        self.add_trigger(trigger_name or "http", trigger)
         return self
 
     def add_model(self, name, model_path, **kw):
+        warnings.warn(
+            'This method is deprecated and will be removed in 0.10.0. Use the "serving" runtime instead',
+            # TODO: remove in 0.10.0
+            DeprecationWarning,
+        )
         if model_path.startswith("v3io://"):
             model = "/User/" + "/".join(model_path.split("/")[5:])
         else:
@@ -399,6 +482,11 @@ class RemoteRuntime(KubeResource):
         workers=8,
         canary=None,
     ):
+        warnings.warn(
+            'This method is deprecated and will be removed in 0.10.0. Use the "serving" runtime instead',
+            # TODO: remove in 0.10.0
+            DeprecationWarning,
+        )
 
         if models:
             for k, v in models.items():
@@ -418,14 +506,36 @@ class RemoteRuntime(KubeResource):
         return self
 
     def add_v3io_stream_trigger(
-        self, stream_path, name="stream", group="serving", seek_to="earliest", shards=1,
+        self,
+        stream_path,
+        name="stream",
+        group="serving",
+        seek_to="earliest",
+        shards=1,
+        extra_attributes=None,
+        ack_window_size=None,
+        **kwargs,
     ):
-        """add v3io stream trigger to the function"""
+        """add v3io stream trigger to the function
+
+        :param stream_path:    v3io stream path (e.g. 'v3io:///projects/myproj/stream1'
+        :param name:           trigger name
+        :param group:          consumer group
+        :param seek_to:        start seek from: "earliest", "latest", "time", "sequence"
+        :param shards:         number of shards (used to set number of replicas)
+        :param extra_attributes: key/value dict with extra trigger attributes
+        :param ack_window_size:  stream ack window size (the consumer group will be updated with the
+                                 event id - ack_window_size, on failure the events in the window will be retransmitted)
+        :param kwargs:         extra V3IOStreamTrigger class attributes
+        """
         endpoint = None
         if "://" in stream_path:
             endpoint, stream_path = parse_v3io_path(stream_path, suffix="")
         container, path = split_path(stream_path)
         shards = shards or 1
+        extra_attributes = extra_attributes or {}
+        if ack_window_size:
+            extra_attributes["ackWindowSize"] = ack_window_size
         self.add_trigger(
             name,
             V3IOStreamTrigger(
@@ -435,14 +545,20 @@ class RemoteRuntime(KubeResource):
                 consumerGroup=group,
                 seekTo=seek_to,
                 webapi=endpoint or "http://v3io-webapi:8081",
+                extra_attributes=extra_attributes,
+                **kwargs,
             ),
         )
         self.spec.min_replicas = shards
         self.spec.max_replicas = shards
 
     def add_secrets_config_to_spec(self):
-        # Currently secrets are only handled in Serving runtime.
-        pass
+        # For nuclio functions, we just add the project secrets as env variables. Since there's no MLRun code
+        # to decode the secrets and special env variable names in the function, we just use the same env variable as
+        # the key name (encode_key_names=False)
+        self._add_project_k8s_secrets_to_spec(
+            None, project=self.metadata.project, encode_key_names=False
+        )
 
     def deploy(
         self,
@@ -452,6 +568,14 @@ class RemoteRuntime(KubeResource):
         verbose=False,
         auth_info: AuthInfo = None,
     ):
+        """Deploy the nuclio function to the cluster
+
+        :param dashboard:  address of the nuclio dashboard service (keep blank for current cluster)
+        :param project:    project name
+        :param tag:        function tag
+        :param verbose:    set True for verbose logging
+        :param auth_info:  service AuthInfo
+        """
         # todo: verify that the function name is normalized
 
         verbose = verbose or self.verbose
@@ -546,10 +670,12 @@ class RemoteRuntime(KubeResource):
         node_selector: typing.Optional[typing.Dict[str, str]] = None,
         affinity: typing.Optional[client.V1Affinity] = None,
     ):
+        """k8s node selection attributes"""
         super().with_node_selection(node_name, node_selector, affinity)
 
     @min_nuclio_versions("1.6.18")
     def with_priority_class(self, name: typing.Optional[str] = None):
+        """k8s priority class"""
         super().with_priority_class(name)
 
     def _get_state(
@@ -694,6 +820,7 @@ class RemoteRuntime(KubeResource):
         verbose=None,
         use_function_from_db=True,
     ):
+        """return as a Kubeflow pipeline step (ContainerOp), recommended to use mlrun.deploy_function() instead"""
         models = {} if models is None else models
         function_name = self.metadata.name or "function"
         name = f"deploy_{function_name}"
@@ -720,14 +847,28 @@ class RemoteRuntime(KubeResource):
 
     def invoke(
         self,
-        path,
-        body=None,
-        method=None,
-        headers=None,
-        dashboard="",
-        force_external_address=False,
+        path: str,
+        body: typing.Union[str, bytes, dict] = None,
+        method: str = None,
+        headers: dict = None,
+        dashboard: str = "",
+        force_external_address: bool = False,
         auth_info: AuthInfo = None,
     ):
+        """Invoke the remote (live) function and return the results
+
+        example::
+
+            function.invoke("/api", body={"inputs": x})
+
+        :param path:     request sub path (e.g. /images)
+        :param body:     request body (str, bytes or a dict for json requests)
+        :param method:   HTTP method (GET, PUT, ..)
+        :param headers:  key/value dict with http headers
+        :param dashboard: nuclio dashboard address
+        :param force_external_address:   use the external ingress URL
+        :param auth_info: service AuthInfo
+        """
         if not method:
             method = "POST" if body else "GET"
         if "://" not in path:
@@ -760,7 +901,7 @@ class RemoteRuntime(KubeResource):
         except OSError as err:
             raise OSError(f"error: cannot run function at url {path}, {err}")
         if not resp.ok:
-            raise RuntimeError(f"bad function response {resp.text}")
+            raise RuntimeError(f"bad function response {resp.status_code}: {resp.text}")
 
         data = resp.content
         if resp.headers["content-type"] == "application/json":
@@ -821,7 +962,7 @@ class RemoteRuntime(KubeResource):
             command = f"{command}/{runobj.spec.handler_name}"
         loop = asyncio.get_event_loop()
         future = asyncio.ensure_future(
-            self._invoke_async(tasks, command, headers, secrets)
+            self._invoke_async(tasks, command, headers, secrets, generator=generator)
         )
 
         loop.run_until_complete(future)
@@ -834,26 +975,63 @@ class RemoteRuntime(KubeResource):
         self._store_run_dict(rundict)
         return rundict
 
-    async def _invoke_async(self, runs, url, headers, secrets):
+    async def _invoke_async(self, tasks, url, headers, secrets, generator):
         results = RunList()
-        tasks = []
+        runs = []
+        num_errors = 0
+        stop = False
+        parallel_runs = generator.options.parallel_runs or 1
+        semaphore = asyncio.Semaphore(parallel_runs)
 
         async with ClientSession() as session:
-            for run in runs:
-                self.store_run(run)
-                run.spec.secret_sources = secrets or []
-                tasks.append(asyncio.ensure_future(submit(session, url, run, headers),))
+            for task in tasks:
+                # TODO: store run using async calls to improve performance
+                self.store_run(task)
+                task.spec.secret_sources = secrets or []
+                resp = submit(session, url, task, semaphore, headers=headers)
+                runs.append(asyncio.ensure_future(resp,))
 
-            for status, resp, logs, run in await asyncio.gather(*tasks):
+            for result in asyncio.as_completed(runs):
+                status, resp, logs, task = await result
 
                 if status != 200:
-                    logger.error(f"failed to access {url} - {resp}")
+                    err_message = f"failed to access {url} - {resp}"
+                    # TODO: store logs using async calls to improve performance
+                    log_std(
+                        self._db_conn,
+                        task,
+                        parse_logs(logs) if logs else None,
+                        err_message,
+                        silent=True,
+                    )
+                    # TODO: update run using async calls to improve performance
+                    results.append(self._update_run_state(task=task, err=err_message))
+                    num_errors += 1
                 else:
-                    results.append(self._update_state(json.loads(resp)))
+                    if logs:
+                        log_std(self._db_conn, task, parse_logs(logs))
+                    resp = self._update_run_state(json.loads(resp))
+                    state = get_in(resp, "status.state", "")
+                    if state == "error":
+                        num_errors += 1
+                    results.append(resp)
 
-                if logs:
-                    log_std(self._db_conn, run, parse_logs(logs))
+                    run_results = get_in(resp, "status.results", {})
+                    stop = generator.eval_stop_condition(run_results)
+                    if stop:
+                        logger.info(
+                            f"reached early stop condition ({generator.options.stop_condition}), stopping iterations!"
+                        )
+                        break
 
+                if num_errors > generator.max_errors:
+                    logger.error("max errors reached, stopping iterations!")
+                    stop = True
+                    break
+
+        if stop:
+            for task in runs:
+                task.cancel()
         return results
 
     def _resolve_invocation_url(self, path, force_external_address):
@@ -896,11 +1074,12 @@ def parse_logs(logs):
     return lines
 
 
-async def submit(session, url, run, headers=None):
-    async with session.put(url, json=run.to_dict(), headers=headers) as response:
-        text = await response.text()
-        logs = response.headers.get("X-Nuclio-Logs", None)
-        return response.status, text, logs, run
+async def submit(session, url, run, semaphore, headers=None):
+    async with semaphore:
+        async with session.put(url, json=run.to_dict(), headers=headers) as response:
+            text = await response.text()
+            logs = response.headers.get("X-Nuclio-Logs", None)
+            return response.status, text, logs, run
 
 
 def fake_nuclio_context(body, headers=None):
@@ -1024,6 +1203,9 @@ def compile_function_config(function: RemoteRuntime):
         spec.set_config("spec.minReplicas", function.spec.min_replicas)
         spec.set_config("spec.maxReplicas", function.spec.max_replicas)
 
+    if function.spec.service_account:
+        spec.set_config("spec.serviceAccount", function.spec.service_account)
+
     if function.spec.base_spec or function.spec.build.functionSourceCode:
         config = function.spec.base_spec
         if not config:
@@ -1037,7 +1219,11 @@ def compile_function_config(function: RemoteRuntime):
         )
         update_in(config, "metadata.name", function.metadata.name)
         update_in(config, "spec.volumes", function.spec.generate_nuclio_volumes())
-        base_image = get_in(config, "spec.build.baseImage") or function.spec.image
+        base_image = (
+            get_in(config, "spec.build.baseImage")
+            or function.spec.image
+            or function.spec.build.base_image
+        )
         if base_image:
             update_in(config, "spec.build.baseImage", enrich_image_url(base_image))
 
@@ -1059,10 +1245,12 @@ def compile_function_config(function: RemoteRuntime):
         )
 
         update_in(config, "spec.volumes", function.spec.generate_nuclio_volumes())
-        if function.spec.image:
+        base_image = function.spec.image or function.spec.build.base_image
+        if base_image:
             update_in(
-                config, "spec.build.baseImage", enrich_image_url(function.spec.image)
+                config, "spec.build.baseImage", enrich_image_url(base_image),
             )
+
         name = get_fullname(name, project, tag)
         function.status.nuclio_name = name
 
@@ -1072,7 +1260,6 @@ def compile_function_config(function: RemoteRuntime):
 
 
 def enrich_function_with_ingress(config, mode, service_type):
-
     # do not enrich with an ingress
     if mode == NuclioIngressAddTemplatedIngressModes.never:
         return
@@ -1087,7 +1274,6 @@ def enrich_function_with_ingress(config, mode, service_type):
     # we would enrich it with an ingress
     http_trigger = resolve_function_http_trigger(config["spec"])
     if not http_trigger:
-
         # function has an HTTP trigger without an ingress
         # TODO: read from nuclio-api frontend-spec
         http_trigger = {

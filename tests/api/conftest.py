@@ -10,10 +10,11 @@ import mlrun.api.utils.singletons.k8s
 from mlrun import mlconf
 from mlrun.api.db.sqldb.session import _init_engine, create_session
 from mlrun.api.initial_data import init_data
-from mlrun.api.main import app
+from mlrun.api.main import BASE_VERSIONED_API_PREFIX, app
 from mlrun.api.utils.singletons.db import initialize_db
 from mlrun.api.utils.singletons.project_member import initialize_project_member
 from mlrun.config import config
+from mlrun.secrets import SecretsStore
 from mlrun.utils import logger
 
 
@@ -46,6 +47,15 @@ def db() -> Generator:
     db_file.close()
 
 
+def set_base_url_for_test_client(
+    client: TestClient, prefix: str = BASE_VERSIONED_API_PREFIX
+):
+    client.base_url = client.base_url + prefix
+
+    # https://stackoverflow.com/questions/10893374/python-confusions-with-urljoin/10893427#10893427
+    client.base_url = client.base_url.rstrip("/") + "/"
+
+
 @pytest.fixture()
 def client(db) -> Generator:
     with TemporaryDirectory(suffix="mlrun-logs") as log_dir:
@@ -55,6 +65,7 @@ def client(db) -> Generator:
         mlconf.httpdb.projects.periodic_sync_interval = "0 seconds"
 
         with TestClient(app) as c:
+            set_base_url_for_test_client(c)
             yield c
 
 
@@ -62,6 +73,14 @@ class K8sSecretsMock:
     def __init__(self):
         # project -> secret_key -> secret_value
         self.project_secrets_map = {}
+        self._is_running_in_k8s = True
+
+    # cannot use a property since it's used as a side-effect in the fixture's mock.
+    def is_running_in_k8s_cluster(self) -> bool:
+        return self._is_running_in_k8s
+
+    def set_is_running_in_k8s_cluster(self, value: bool):
+        self._is_running_in_k8s = value
 
     def store_project_secrets(self, project, secrets, namespace=""):
         self.project_secrets_map.setdefault(project, {}).update(secrets)
@@ -84,6 +103,26 @@ class K8sSecretsMock:
             if (secret_keys and key in secret_keys) or not secret_keys
         }
 
+    def get_expected_env_variables_from_secrets(
+        self, project, encode_key_names=True, include_internal=False
+    ):
+        expected_env_from_secrets = {}
+        secret_name = mlrun.api.utils.singletons.k8s.get_k8s().get_project_secret_name(
+            project
+        )
+        for key in self.project_secrets_map.get(project, {}):
+            if key.startswith("mlrun.") and not include_internal:
+                continue
+
+            env_variable_name = (
+                SecretsStore.k8s_env_variable_name_for_secret(key)
+                if encode_key_names
+                else key
+            )
+            expected_env_from_secrets[env_variable_name] = {secret_name: key}
+
+        return expected_env_from_secrets
+
     def assert_project_secrets(self, project: str, secrets: dict):
         assert (
             deepdiff.DeepDiff(
@@ -92,15 +131,45 @@ class K8sSecretsMock:
             == {}
         )
 
+    def set_service_account_keys(
+        self, project, default_service_account, allowed_service_accounts
+    ):
+        secrets = {}
+        if default_service_account:
+            secrets[
+                mlrun.api.crud.secrets.Secrets().generate_service_account_secret_key(
+                    "default"
+                )
+            ] = default_service_account
+        if allowed_service_accounts:
+            secrets[
+                mlrun.api.crud.secrets.Secrets().generate_service_account_secret_key(
+                    "allowed"
+                )
+            ] = ",".join(allowed_service_accounts)
+        self.store_project_secrets(project, secrets)
+
 
 @pytest.fixture()
 def k8s_secrets_mock(client: TestClient) -> K8sSecretsMock:
     logger.info("Creating k8s secrets mock")
     k8s_secrets_mock = K8sSecretsMock()
-    config.namespace = "default-tenant"
+
+    mocked_function_names = [
+        "is_running_inside_kubernetes_cluster",
+        "get_project_secret_keys",
+        "get_project_secret_data",
+        "store_project_secrets",
+        "delete_project_secrets",
+    ]
+
+    original_functions = {
+        name: getattr(mlrun.api.utils.singletons.k8s.get_k8s(), name)
+        for name in mocked_function_names
+    }
 
     mlrun.api.utils.singletons.k8s.get_k8s().is_running_inside_kubernetes_cluster = unittest.mock.Mock(
-        return_value=True
+        side_effect=k8s_secrets_mock.is_running_in_k8s_cluster
     )
     mlrun.api.utils.singletons.k8s.get_k8s().get_project_secret_keys = unittest.mock.Mock(
         side_effect=k8s_secrets_mock.get_project_secret_keys
@@ -115,4 +184,10 @@ def k8s_secrets_mock(client: TestClient) -> K8sSecretsMock:
         side_effect=k8s_secrets_mock.delete_project_secrets
     )
 
-    return k8s_secrets_mock
+    yield k8s_secrets_mock
+
+    # Revert mocked functions
+    for func in mocked_function_names:
+        setattr(
+            mlrun.api.utils.singletons.k8s.get_k8s(), func, original_functions[func]
+        )

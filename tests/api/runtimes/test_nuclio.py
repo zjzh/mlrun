@@ -7,11 +7,13 @@ import deepdiff
 import kubernetes
 import nuclio
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 import mlrun.errors
 from mlrun import code_to_function, mlconf
+from mlrun.api.api.endpoints.functions import _build_function
 from mlrun.platforms.iguazio import split_path
 from mlrun.runtimes.constants import NuclioIngressAddTemplatedIngressModes
 from mlrun.runtimes.function import (
@@ -23,6 +25,7 @@ from mlrun.runtimes.function import (
     validate_nuclio_version_compatibility,
 )
 from mlrun.runtimes.pod import KubeResourceSpec
+from tests.api.conftest import K8sSecretsMock
 from tests.api.runtimes.base import TestRuntimeBase
 
 
@@ -60,6 +63,7 @@ class TestNuclioRuntime(TestRuntimeBase):
     def _get_expected_struct_for_http_trigger(parameters):
         expected_struct = {
             "kind": "http",
+            "name": "http",
             "maxWorkers": parameters["workers"],
             "attributes": {
                 "ingresses": {
@@ -118,6 +122,9 @@ class TestNuclioRuntime(TestRuntimeBase):
         call_count=1,
         expected_params=[],
         expected_labels=None,
+        expected_env_from_secrets=None,
+        expected_service_account=None,
+        expected_build_base_image=None,
     ):
         if expected_labels is None:
             expected_labels = {}
@@ -159,7 +166,20 @@ class TestNuclioRuntime(TestRuntimeBase):
             ).decode("utf-8")
             assert spec_source_code.startswith(original_source_code)
 
-            assert build_info["baseImage"] == self.image_name
+            if self.image_name or expected_build_base_image:
+                assert (
+                    build_info["baseImage"] == self.image_name
+                    or expected_build_base_image
+                )
+
+            if expected_env_from_secrets:
+                env_vars = deploy_config["spec"]["env"]
+                self._assert_pod_env_from_secrets(env_vars, expected_env_from_secrets)
+
+            if expected_service_account:
+                assert (
+                    deploy_config["spec"]["serviceAccount"] == expected_service_account
+                )
 
     def _assert_triggers(self, http_trigger=None, v3io_trigger=None):
         args, _ = nuclio.deploy.deploy_config.call_args
@@ -256,7 +276,6 @@ class TestNuclioRuntime(TestRuntimeBase):
                 == {}
             )
         if expected_affinity:
-
             # deploy_spec returns affinity in CamelCase, V1Affinity is in snake_case
             assert (
                 deepdiff.DeepDiff(
@@ -362,10 +381,90 @@ class TestNuclioRuntime(TestRuntimeBase):
         for expected_env_var in expected_env_vars:
             assert expected_env_var in config["spec"]["env"]
 
+    def test_deploy_with_project_secrets(
+        self, db: Session, k8s_secrets_mock: K8sSecretsMock
+    ):
+        secret_keys = ["secret1", "secret2", "secret3"]
+        secrets = {key: "some-secret-value" for key in secret_keys}
+
+        k8s_secrets_mock.store_project_secrets(self.project, secrets)
+
+        function = self._generate_runtime(self.runtime_kind)
+        self._serialize_and_deploy_nuclio_function(function)
+
+        # This test runs in serving, nuclio:mlrun as well, with different secret names encoding
+        expected_secrets = k8s_secrets_mock.get_expected_env_variables_from_secrets(
+            self.project, encode_key_names=(self.class_name != "remote")
+        )
+        self._assert_deploy_called_basic_config(
+            expected_class=self.class_name, expected_env_from_secrets=expected_secrets
+        )
+
+    def test_deploy_with_service_accounts(
+        self, db: Session, k8s_secrets_mock: K8sSecretsMock
+    ):
+        k8s_secrets_mock.set_service_account_keys(self.project, "sa1", ["sa1", "sa2"])
+
+        function = self._generate_runtime(self.runtime_kind)
+        # Need to call _build_function, since service-account enrichment is happening only on server side, before the
+        # call to deploy_nuclio_function
+        _build_function(db, None, function)
+        self._assert_deploy_called_basic_config(
+            expected_class=self.class_name, expected_service_account="sa1"
+        )
+        nuclio.deploy.deploy_config.reset_mock()
+
+        function.spec.service_account = "bad-sa"
+        with pytest.raises(HTTPException):
+            _build_function(db, None, function)
+
+        function.spec.service_account = "sa2"
+        _build_function(db, None, function)
+        self._assert_deploy_called_basic_config(
+            expected_class=self.class_name, expected_service_account="sa2"
+        )
+
     def test_deploy_basic_function(self, db: Session, client: TestClient):
         function = self._generate_runtime(self.runtime_kind)
 
         self._serialize_and_deploy_nuclio_function(function)
+        self._assert_deploy_called_basic_config(expected_class=self.class_name)
+
+    def test_deploy_build_base_image(
+        self, db: Session, k8s_secrets_mock: K8sSecretsMock
+    ):
+        expected_build_base_image = "mlrun/base_mlrun:latest"
+        self.image_name = None
+
+        function = self._generate_runtime(self.runtime_kind)
+        function.spec.build.base_image = expected_build_base_image
+
+        self._serialize_and_deploy_nuclio_function(function)
+        self._assert_deploy_called_basic_config(
+            expected_class=self.class_name,
+            expected_build_base_image=expected_build_base_image,
+        )
+
+    def test_deploy_image_name_and_build_base_image(
+        self, db: Session, k8s_secrets_mock: K8sSecretsMock
+    ):
+        """When spec.image and also spec.build.base_image are both defined the spec.image should be applied
+         to spec.baseImage in nuclio."""
+
+        function = self._generate_runtime(self.runtime_kind)
+        function.spec.build.base_image = "mlrun/base_mlrun:latest"
+
+        self._serialize_and_deploy_nuclio_function(function)
+        self._assert_deploy_called_basic_config(expected_class=self.class_name)
+
+    def test_deploy_without_image_and_build_base_image(
+        self, db: Session, k8s_secrets_mock: K8sSecretsMock
+    ):
+        self.image_name = None
+
+        function = self._generate_runtime(self.runtime_kind)
+        self._serialize_and_deploy_nuclio_function(function)
+
         self._assert_deploy_called_basic_config(expected_class=self.class_name)
 
     def test_deploy_function_with_labels(self, db: Session, client: TestClient):
@@ -702,3 +801,11 @@ class TestNuclioRuntime(TestRuntimeBase):
                 },
             },
         }
+
+
+# Kind of "nuclio:mlrun" is a special case of nuclio functions. Run the same suite of tests here as well
+class TestNuclioMLRunRuntime(TestNuclioRuntime):
+    @property
+    def runtime_kind(self):
+        # enables extending classes to run the same tests with different runtime
+        return "nuclio:mlrun"

@@ -4,9 +4,22 @@ from typing import List
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
-from scikitplot.metrics import plot_calibration_curve
-from scipy import interp
+
+try:
+    import seaborn as sns
+except ModuleNotFoundError:
+    pass
+
+try:
+    from scikitplot.metrics import plot_calibration_curve
+except ModuleNotFoundError:
+    pass
+
+try:
+    from scipy import interp
+except ModuleNotFoundError:
+    pass
+
 from sklearn import metrics
 from sklearn.base import is_classifier, is_regressor
 from sklearn.calibration import calibration_curve
@@ -36,7 +49,7 @@ def feature_importances(model, header):
     """
     if not hasattr(model, "feature_importances_"):
         raise Exception(
-            "feature importances are only available for some models, if you got"
+            "feature importances are only available for some models, if you got "
             "here then please make sure to check your estimated model for a "
             "`feature_importances_` attribute before calling this method"
         )

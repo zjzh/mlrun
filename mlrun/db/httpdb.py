@@ -16,6 +16,7 @@ import http
 import os
 import tempfile
 import time
+import traceback
 import warnings
 from datetime import datetime
 from os import path, remove
@@ -118,6 +119,25 @@ class HTTPRunDB(RunDBInterface):
         cls = self.__class__.__name__
         return f"{cls}({self.base_url!r})"
 
+    @staticmethod
+    def get_api_path_prefix(version: str = None) -> str:
+        """
+            :param version: API version to use, None (the default) will mean to use the default value from mlconf,
+             for un-versioned api set an empty string.
+        """
+        if version is not None:
+            return f"api/{version}" if version else "api"
+
+        api_version_path = (
+            f"api/{config.api_base_version}" if config.api_base_version else "api"
+        )
+        return api_version_path
+
+    def get_base_api_url(self, path: str, version: str = None) -> str:
+        path_prefix = self.get_api_path_prefix(version)
+        url = f"{self.base_url}/{path_prefix}/{path}"
+        return url
+
     def api_call(
         self,
         method,
@@ -128,6 +148,7 @@ class HTTPRunDB(RunDBInterface):
         json=None,
         headers=None,
         timeout=45,
+        version=None,
     ):
         """ Perform a direct REST API call on the :py:mod:`mlrun` API server.
 
@@ -142,10 +163,12 @@ class HTTPRunDB(RunDBInterface):
             :param json: JSON payload to be passed in the call
             :param headers: REST headers, passed as a dictionary: ``{"<header-name>": "<header-value>"}``
             :param timeout: API call timeout
+            :param version: API version to use, None (the default) will mean to use the default value from config,
+             for un-versioned api set an empty string.
 
             :return: Python HTTP response object
         """
-        url = f"{self.base_url}/api/{path}"
+        url = self.get_base_api_url(path, version)
         kw = {
             key: value
             for key, value in (
@@ -297,9 +320,17 @@ class HTTPRunDB(RunDBInterface):
                 server_cfg.get("spark_operator_version")
                 or config.spark_operator_version
             )
+            config.default_tensorboard_logs_path = (
+                server_cfg.get("default_tensorboard_logs_path")
+                or config.default_tensorboard_logs_path
+            )
 
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Failed syncing config from server",
+                exc=str(exc),
+                traceback=traceback.format_exc(),
+            )
         return self
 
     def store_log(self, uid, project="", body=None, append=False):
@@ -449,6 +480,10 @@ class HTTPRunDB(RunDBInterface):
         start_time_to: datetime = None,
         last_update_time_from: datetime = None,
         last_update_time_to: datetime = None,
+        partition_by: Union[schemas.RunPartitionByField, str] = None,
+        rows_per_partition: int = 1,
+        partition_sort_by: Union[schemas.SortField, str] = None,
+        partition_order: Union[schemas.OrderType, str] = schemas.OrderType.desc,
     ) -> RunList:
         """ Retrieve a list of runs, filtered by various options.
         Example::
@@ -473,6 +508,13 @@ class HTTPRunDB(RunDBInterface):
         :param last_update_time_from: Filter by run last update time in ``(last_update_time_from,
             last_update_time_to)``.
         :param last_update_time_to: Filter by run last update time in ``(last_update_time_from, last_update_time_to)``.
+        :param partition_by: Field to group results by. Only allowed value is `name`. When `partition_by` is specified,
+            the `partition_sort_by` parameter must be provided as well.
+        :param rows_per_partition: How many top rows (per sorting defined by `partition_sort_by` and `partition_order`)
+            to return per group. Default value is 1.
+        :param partition_sort_by: What field to sort the results by, within each partition defined by `partition_by`.
+            Currently the only allowed values are `created` and `updated`.
+        :param partition_order: Order of sorting within partitions - `asc` or `desc`. Default is `desc`.
         """
 
         project = project or config.default_project
@@ -489,6 +531,17 @@ class HTTPRunDB(RunDBInterface):
             "last_update_time_from": datetime_to_iso(last_update_time_from),
             "last_update_time_to": datetime_to_iso(last_update_time_to),
         }
+
+        if partition_by:
+            params.update(
+                self._generate_partition_by_params(
+                    schemas.RunPartitionByField,
+                    partition_by,
+                    rows_per_partition,
+                    partition_sort_by,
+                    partition_order,
+                )
+            )
         error = "list runs"
         resp = self.api_call("GET", "runs", error, params=params)
         return RunList(resp.json()["runs"])
@@ -574,6 +627,8 @@ class HTTPRunDB(RunDBInterface):
         until=None,
         iter: int = None,
         best_iteration: bool = False,
+        kind: str = None,
+        category: Union[str, schemas.ArtifactCategories] = None,
     ) -> ArtifactList:
         """ List artifacts filtered by various parameters.
 
@@ -596,9 +651,14 @@ class HTTPRunDB(RunDBInterface):
         :param best_iteration: Returns the artifact which belongs to the best iteration of a given run, in the case of
             artifacts generated from a hyper-param run. If only a single iteration exists, will return the artifact
             from that iteration. If using ``best_iter``, the ``iter`` parameter must not be used.
+        :param kind: Return artifacts of the requested kind.
+        :param category: Return artifacts of the requested category.
         """
 
         project = project or config.default_project
+        if category and isinstance(category, schemas.ArtifactCategories):
+            category = category.value
+
         params = {
             "name": name,
             "project": project,
@@ -606,6 +666,8 @@ class HTTPRunDB(RunDBInterface):
             "label": labels or [],
             "iter": iter,
             "best-iteration": best_iteration,
+            "kind": kind,
+            "category": category,
         }
         error = "list artifacts"
         resp = self.api_call("GET", "artifacts", error, params=params)
@@ -1152,7 +1214,9 @@ class HTTPRunDB(RunDBInterface):
 
         return schemas.BackgroundTask(**resp.json())
 
-    def get_background_task(self, project: str, name: str,) -> schemas.BackgroundTask:
+    def get_project_background_task(
+        self, project: str, name: str,
+    ) -> schemas.BackgroundTask:
         """ Retrieve updated information on a background task being executed."""
 
         project = project or config.default_project
@@ -1489,8 +1553,10 @@ class HTTPRunDB(RunDBInterface):
         return resp.json()["entities"]
 
     @staticmethod
-    def _generate_partition_by_params(partition_by, rows_per_partition, sort_by, order):
-        if isinstance(partition_by, schemas.FeatureStorePartitionByField):
+    def _generate_partition_by_params(
+        partition_by_cls, partition_by, rows_per_partition, sort_by, order
+    ):
+        if isinstance(partition_by, partition_by_cls):
             partition_by = partition_by.value
         if isinstance(sort_by, schemas.SortField):
             sort_by = sort_by.value
@@ -1532,7 +1598,7 @@ class HTTPRunDB(RunDBInterface):
         :param rows_per_partition: How many top rows (per sorting defined by `partition_sort_by` and `partition_order`)
             to return per group. Default value is 1.
         :param partition_sort_by: What field to sort the results by, within each partition defined by `partition_by`.
-            Currently the only allowed value is `updated`.
+            Currently the only allowed value are `created` and `updated`.
         :param partition_order: Order of sorting within partitions - `asc` or `desc`. Default is `desc`.
         :returns: List of matching :py:class:`~mlrun.feature_store.FeatureSet` objects.
         """
@@ -1550,7 +1616,11 @@ class HTTPRunDB(RunDBInterface):
         if partition_by:
             params.update(
                 self._generate_partition_by_params(
-                    partition_by, rows_per_partition, partition_sort_by, partition_order
+                    schemas.FeatureStorePartitionByField,
+                    partition_by,
+                    rows_per_partition,
+                    partition_sort_by,
+                    partition_order,
                 )
             )
 
@@ -1736,7 +1806,7 @@ class HTTPRunDB(RunDBInterface):
         :param rows_per_partition: How many top rows (per sorting defined by `partition_sort_by` and `partition_order`)
             to return per group. Default value is 1.
         :param partition_sort_by: What field to sort the results by, within each partition defined by `partition_by`.
-            Currently the only allowed value is `updated`.
+            Currently the only allowed values are `created` and `updated`.
         :param partition_order: Order of sorting within partitions - `asc` or `desc`. Default is `desc`.
         :returns: List of matching :py:class:`~mlrun.feature_store.FeatureVector` objects.
         """
@@ -1752,7 +1822,11 @@ class HTTPRunDB(RunDBInterface):
         if partition_by:
             params.update(
                 self._generate_partition_by_params(
-                    partition_by, rows_per_partition, partition_sort_by, partition_order
+                    schemas.FeatureStorePartitionByField,
+                    partition_by,
+                    rows_per_partition,
+                    partition_sort_by,
+                    partition_order,
                 )
             )
 
@@ -2050,7 +2124,7 @@ class HTTPRunDB(RunDBInterface):
         project: str,
         provider: Union[
             str, schemas.SecretProviderName
-        ] = schemas.SecretProviderName.vault,
+        ] = schemas.SecretProviderName.kubernetes,
         secrets: dict = None,
     ):
         """ Create project-context secrets using either ``vault`` or ``kubernetes`` provider.
@@ -2075,7 +2149,7 @@ class HTTPRunDB(RunDBInterface):
                 secrets = {'password': 'myPassw0rd', 'aws_key': '111222333'}
                 db.create_project_secrets(
                     "project1",
-                    provider=mlrun.api.schemas.SecretProviderName.vault,
+                    provider=mlrun.api.schemas.SecretProviderName.kubernetes,
                     secrets=secrets
                 )
         """
@@ -2095,7 +2169,7 @@ class HTTPRunDB(RunDBInterface):
         token: str = None,
         provider: Union[
             str, schemas.SecretProviderName
-        ] = schemas.SecretProviderName.vault,
+        ] = schemas.SecretProviderName.kubernetes,
         secrets: List[str] = None,
     ) -> schemas.SecretsData:
         """ Retrieve project-context secrets from Vault.
@@ -2134,7 +2208,7 @@ class HTTPRunDB(RunDBInterface):
         project: str,
         provider: Union[
             str, schemas.SecretProviderName
-        ] = schemas.SecretProviderName.vault,
+        ] = schemas.SecretProviderName.kubernetes,
         token: str = None,
     ) -> schemas.SecretKeysData:
         """ Retrieve project-context secret keys from Vault or Kubernetes.
@@ -2228,7 +2302,7 @@ class HTTPRunDB(RunDBInterface):
         )
 
     @staticmethod
-    def _validate_version_compatibility(server_version, client_version):
+    def _validate_version_compatibility(server_version, client_version) -> bool:
         try:
             parsed_server_version = semver.VersionInfo.parse(server_version)
             parsed_client_version = semver.VersionInfo.parse(client_version)
@@ -2239,18 +2313,30 @@ class HTTPRunDB(RunDBInterface):
                 server_version=server_version,
                 client_version=client_version,
             )
-            return
-        if (
-            parsed_server_version.major != parsed_client_version.major
-            or parsed_server_version.minor != parsed_client_version.minor
+            return True
+        if (parsed_server_version.major == 0 and parsed_server_version.minor == 0) or (
+            parsed_client_version.major == 0 and parsed_client_version.minor == 0
         ):
-            message = "Server and client versions are incompatible"
             logger.warning(
-                message,
+                "Server or client version is unstable. Assuming compatible",
+                server_version=server_version,
+                client_version=client_version,
+            )
+            return True
+        if parsed_server_version.major != parsed_client_version.major:
+            logger.warning(
+                "Server and client versions are incompatible",
                 parsed_server_version=parsed_server_version,
                 parsed_client_version=parsed_client_version,
             )
-            raise mlrun.errors.MLRunIncompatibleVersionError(message)
+            return False
+        if parsed_server_version.minor != parsed_client_version.minor:
+            logger.info(
+                "Server and client versions are not the same",
+                parsed_server_version=parsed_server_version,
+                parsed_client_version=parsed_client_version,
+            )
+        return True
 
     def create_or_patch_model_endpoint(
         self,
@@ -2314,6 +2400,8 @@ class HTTPRunDB(RunDBInterface):
         end: str = "now",
         metrics: Optional[List[str]] = None,
         access_key: Optional[str] = None,
+        top_level: bool = False,
+        uids: Optional[List[str]] = None,
     ) -> schemas.ModelEndpointList:
         """
         Returns a list of ModelEndpointState objects. Each object represents the current state of a model endpoint.
@@ -2336,6 +2424,8 @@ class HTTPRunDB(RunDBInterface):
         :param start: The start time of the metrics
         :param end: The end time of the metrics
         :param access_key: V3IO access key, when None, will be look for in environ
+        :param top_level: if true will return only routers and endpoint that are NOT children of any router
+        :param uids: if passed will return ModelEndpointList of endpoints with uid in uids
         """
         access_key = access_key or os.environ.get("V3IO_ACCESS_KEY")
         if not access_key:
@@ -2355,6 +2445,8 @@ class HTTPRunDB(RunDBInterface):
                 "start": start,
                 "end": end,
                 "metric": metrics or [],
+                "top-level": top_level,
+                "uid": uids,
             },
             headers={"X-V3io-Access-Key": access_key},
         )
@@ -2589,7 +2681,7 @@ class HTTPRunDB(RunDBInterface):
             "POST",
             "authorization/verifications",
             error_message,
-            body=dict_to_json(authorization_verification_input),
+            body=dict_to_json(authorization_verification_input.dict()),
         )
 
 

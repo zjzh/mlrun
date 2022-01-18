@@ -1,6 +1,10 @@
+import unittest.mock
+
 import pytest
+from pandas import Timedelta, Timestamp
 
 import mlrun.errors
+import mlrun.utils.version
 from mlrun.config import config
 from mlrun.datastore.store_resources import parse_store_uri
 from mlrun.utils import logger
@@ -10,7 +14,10 @@ from mlrun.utils.helpers import (
     extend_hub_uri_if_needed,
     fill_artifact_path_template,
     get_parsed_docker_registry,
+    get_pretty_types_names,
+    str_to_timestamp,
     verify_field_regex,
+    verify_list_items_type,
 )
 from mlrun.utils.regex import run_name
 
@@ -218,16 +225,35 @@ def test_enrich_image():
             "expected_output": "mlrun/mlrun:0.5.3",
             "images_to_enrich_registry": "mlrun/mlrun:0.5.2",
         },
+        {
+            "image": "mlrun/mlrun",
+            "expected_output": "ghcr.io/mlrun/mlrun:unstable",
+            "images_tag": None,
+            "version": "0.0.0+unstable",
+        },
+        {
+            "image": "mlrun/mlrun",
+            "expected_output": "ghcr.io/mlrun/mlrun:0.1.2-some-special-tag",
+            "images_tag": None,
+            "version": "0.1.2+some-special-tag",
+        },
     ]
-    config.images_tag = "0.5.2-unstable-adsf76s"
+    default_images_to_enrich_registry = config.images_to_enrich_registry
     for case in cases:
+        config.images_tag = case.get("images_tag", "0.5.2-unstable-adsf76s")
         config.images_registry = case.get("images_registry", "ghcr.io/")
-        if case.get("images_to_enrich_registry") is not None:
-            config.images_to_enrich_registry = case["images_to_enrich_registry"]
+        config.images_to_enrich_registry = case.get(
+            "images_to_enrich_registry", default_images_to_enrich_registry
+        )
+        if case.get("version") is not None:
+            mlrun.utils.version.Version().get = unittest.mock.Mock(
+                return_value={"version": case["version"]}
+            )
+        config.images_tag = case.get("images_tag", "0.5.2-unstable-adsf76s")
         image = case["image"]
         expected_output = case["expected_output"]
         output = enrich_image_url(image)
-        assert expected_output == output
+        assert output == expected_output
 
 
 def test_get_parsed_docker_registry():
@@ -333,3 +359,79 @@ def test_fill_artifact_path_template():
                 case["artifact_path"], case.get("project")
             )
             assert case["expected_artifact_path"] == filled_artifact_path
+
+
+@pytest.mark.parametrize("actual_list", [[1], [1, "asd"], [None], ["asd", 23]])
+@pytest.mark.parametrize("expected_types", [[str]])
+def test_verify_list_types_failure(actual_list, expected_types):
+    with pytest.raises(mlrun.errors.MLRunInvalidArgumentTypeError):
+        verify_list_items_type(actual_list, expected_types)
+
+
+@pytest.mark.parametrize(
+    "actual_list", [[1.0, 8, "test"], ["test", 0.0], [None], [[["test"], 23]]]
+)
+@pytest.mark.parametrize("expected_types", [[str, int]])
+def test_verify_list_multiple_types_failure(actual_list, expected_types):
+    with pytest.raises(mlrun.errors.MLRunInvalidArgumentTypeError):
+        verify_list_items_type(actual_list, expected_types)
+
+
+@pytest.mark.parametrize("actual_list", [[], ["test"], ["test", "test1"]])
+@pytest.mark.parametrize("expected_types", [[str]])
+def test_verify_list_types_success(actual_list, expected_types):
+    verify_list_items_type(actual_list, expected_types)
+
+
+@pytest.mark.parametrize(
+    "actual_list",
+    [[1, 8, "test"], ["test", 0], [], ["test", 23, "test"], ["test"], [1], [123, 123]],
+)
+@pytest.mark.parametrize("expected_types", [[str, int]])
+def test_verify_list_multiple_types_success(actual_list, expected_types):
+    verify_list_items_type(actual_list, expected_types)
+
+
+def test_get_pretty_types_names():
+    cases = [
+        ([], ""),
+        ([str], "str"),
+        ([str, int], "Union[str,int]"),
+    ]
+    for types, expected in cases:
+        pretty_result = get_pretty_types_names(types)
+        assert pretty_result == expected
+
+
+def test_str_to_timestamp():
+    now_time = Timestamp("2021-01-01 00:01:00")
+    cases = [
+        (None, None, None),
+        ("1/1/2022", Timestamp("2022-01-01 00:00:00"), None),
+        (Timestamp("1/1/2022"), Timestamp("1/1/2022"), None),
+        ("not now", None, ValueError),
+        (" now ", now_time, None),
+        (" now floor 1H", now_time - Timedelta("1m"), None),
+        ("now - 1d1h", now_time - Timedelta("1d1h"), None),
+        ("now +1d1m", now_time + Timedelta("1d1m"), None),
+        ("now +1d1m floor 1D", now_time + Timedelta("1d") - Timedelta("1m"), None),
+        ("now * 1d1m", None, mlrun.errors.MLRunInvalidArgumentError),
+        (
+            "2022-01-11T18:28:00+00:00",
+            Timestamp("2022-01-11 18:28:00+0000", tz="UTC"),
+            None,
+        ),
+        (
+            "2022-01-11T18:28:00-06:00",
+            Timestamp("2022-01-11 18:28:00", tz="US/Central"),
+            None,
+        ),
+    ]
+    for time_str, expected, exception in cases:
+        if exception is not None:
+            with pytest.raises(exception):
+                str_to_timestamp(time_str, now_time=now_time)
+        else:
+            timestamp = str_to_timestamp(time_str, now_time=now_time)
+            print(time_str, timestamp, expected)
+            assert timestamp == expected

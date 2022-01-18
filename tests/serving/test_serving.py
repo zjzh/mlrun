@@ -8,7 +8,12 @@ import mlrun
 from mlrun.runtimes import nuclio_init_hook
 from mlrun.runtimes.serving import serving_subkind
 from mlrun.serving import V2ModelServer
-from mlrun.serving.server import GraphContext, MockEvent, create_graph_server
+from mlrun.serving.server import (
+    GraphContext,
+    MockEvent,
+    MockTrigger,
+    create_graph_server,
+)
 from mlrun.serving.states import RouterStep, TaskStep
 from mlrun.utils import logger
 
@@ -144,13 +149,19 @@ def test_v2_get_models():
 
 
 def test_ensemble_get_models():
-    context = init_ctx(ensemble_spec)
-    event = MockEvent("", path="/v2/models/", method="GET")
-    resp = context.mlrun_handler(context, event)
-    data = json.loads(resp.body)
-
+    fn = mlrun.new_function("tests", kind="serving")
+    graph = fn.set_topology(
+        "router",
+        mlrun.serving.routers.VotingEnsemble(
+            vote_type="regression", prediction_col_name="predictions"
+        ),
+    )
+    graph.routes = generate_test_routes("EnsembleModelTestingClass")
+    server = fn.to_mock_server()
+    logger.info(f"flow: {graph.to_yaml()}")
+    resp = server.test("/v2/models/", testdata)
     # expected: {"models": ["m1", "m2", "m3:v1", "m3:v2", "VotingEnsemble"]}
-    assert len(data["models"]) == 5, f"wrong get models response {resp.body}"
+    assert len(resp["models"]) == 5, f"wrong get models response {resp}"
 
 
 def test_ensemble_infer():
@@ -240,8 +251,9 @@ def test_v2_async_mode():
         resp.status_code != 200
     ), f"expected failure, got {resp.status_code} {resp.body}"
 
-    event = MockEvent('{"model": "m5", "inputs": [5]}')
-    event.trigger = "stream"
+    event = MockEvent(
+        '{"model": "m5", "inputs": [5]}', trigger=MockTrigger(kind="stream")
+    )
     resp = context.mlrun_handler(context, event)
     context.logger.info("model responded")
     logger.info(resp)
@@ -333,14 +345,54 @@ def test_v2_mock():
 def test_function():
     fn = mlrun.new_function("tests", kind="serving")
     graph = fn.set_topology("router")
-    fn.add_model("my", class_name="ModelTestingClass", model_path=".", multiplier=100)
+    fn.add_model("my", ".", class_name=ModelTestingClass(multiplier=100))
     fn.set_tracking("dummy://")  # track using the _DummyStream
 
     server = fn.to_mock_server()
     logger.info(f"flow: {graph.to_yaml()}")
     resp = server.test("/v2/models/my/infer", testdata)
     # expected: source (5) * multiplier (100)
-    assert resp["outputs"] == 5 * 100, f"wrong health response {resp}"
+    assert resp["outputs"] == 5 * 100, f"wrong data response {resp}"
 
     dummy_stream = server.context.stream.output_stream
     assert len(dummy_stream.event_list) == 1, "expected stream to get one message"
+
+
+def test_serving_no_router():
+    fn = mlrun.new_function("tests", kind="serving")
+    graph = fn.set_topology("flow", engine="sync")
+    graph.to("ModelTestingClass", "my2", model_path=".", multiplier=100).respond()
+
+    server = fn.to_mock_server()
+
+    resp = server.test("/", method="GET")
+    assert resp["name"] == "my2", f"wrong get response {resp}"
+
+    resp = server.test("/ready", method="GET")
+    assert resp.status_code == 200, f"wrong health response {resp}"
+
+    resp = server.test("/", testdata)
+    # expected: source (5) * multiplier (100)
+    assert resp["outputs"] == 5 * 100, f"wrong data response {resp}"
+
+
+def test_model_chained():
+    fn = mlrun.new_function("demo", kind="serving")
+    graph = fn.set_topology("flow", engine="async")
+    graph.to(
+        ModelTestingClass(name="m1", model_path=".", multiplier=2),
+        result_path="m1",
+        input_path="req",
+    ).to(
+        ModelTestingClass(
+            name="m2", model_path=".", result_path="m2", multiplier=3, input_path="req"
+        )
+    ).respond()
+    server = fn.to_mock_server()
+
+    resp = server.test(body={"req": {"inputs": [5]}})
+    server.wait_for_completion()
+    assert list(resp.keys()) == ["req", "m1", "m2"], "unexpected keys in resp"
+    assert (
+        resp["m1"]["outputs"] == 5 * 2 and resp["m2"]["outputs"] == 5 * 3
+    ), "unexpected model results"

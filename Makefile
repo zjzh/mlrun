@@ -13,7 +13,16 @@
 # limitations under the License.
 
 MLRUN_VERSION ?= unstable
-MLRUN_DOCKER_TAG ?= $(MLRUN_VERSION)
+# pip requires the python version to be according to some regex (so "unstable" is not valid for example) this regex only
+# allows us to have free text (like unstable) after the "+". on the contrary in a docker tag "+" is not a valid
+# character so we're doing best effort - if the provided version doesn't look valid (like unstable), we prefix the
+# version for the python package with 0.0.0+
+# if the provided version includes a "+" we replace it with "-" for the docker tag
+MLRUN_DOCKER_TAG ?= $(shell echo "$(MLRUN_VERSION)" | sed -E 's/\+/\-/g')
+MLRUN_PYTHON_PACKAGE_VERSION ?= $(MLRUN_VERSION)
+ifeq ($(shell echo "$(MLRUN_VERSION)" | grep -E "^[0-9]+\.[0-9]+\.[0-9]+.*$$"),) # empty result from egrep
+	MLRUN_PYTHON_PACKAGE_VERSION := 0.0.0+$(MLRUN_VERSION)
+endif
 MLRUN_DOCKER_REPO ?= mlrun
 # empty by default (dockerhub), can be set to something like "quay.io/".
 # This will be used to tag the images built using this makefile
@@ -22,9 +31,8 @@ MLRUN_DOCKER_REGISTRY ?=
 # disable caching)
 MLRUN_NO_CACHE ?=
 MLRUN_ML_DOCKER_IMAGE_NAME_PREFIX ?= ml-
-MLRUN_PYTHON_VERSION ?= 3.7.9
+MLRUN_PYTHON_VERSION ?= 3.7.11
 MLRUN_LEGACY_ML_PYTHON_VERSION ?= 3.6.12
-MLRUN_MLUTILS_GITHUB_TAG ?= development
 MLRUN_CACHE_DATE ?= $(shell date +%s)
 # empty by default, can be set to something like "tag-name" which will cause to:
 # 1. docker pull the same image with the given tag (cache image) before the build
@@ -35,8 +43,8 @@ MLRUN_GIT_ORG ?= mlrun
 MLRUN_RELEASE_BRANCH ?= master
 MLRUN_SYSTEM_TESTS_CLEAN_RESOURCES ?= true
 MLRUN_CUDA_VERSION = 11.0
-MLRUN_TENSORFLOW_VERSION = 2.4.1
-MLRUN_HOROVOD_VERSION = 0.22.1
+MLRUN_TENSORFLOW_VERSION = 2.7.0
+MLRUN_HOROVOD_VERSION = 0.23.0
 
 
 MLRUN_DOCKER_IMAGE_PREFIX := $(if $(MLRUN_DOCKER_REGISTRY),$(strip $(MLRUN_DOCKER_REGISTRY))$(MLRUN_DOCKER_REPO),$(MLRUN_DOCKER_REPO))
@@ -49,6 +57,7 @@ MLRUN_DOCKER_NO_CACHE_FLAG := $(if $(MLRUN_NO_CACHE),--no-cache,)
 MLRUN_PIP_NO_CACHE_FLAG := $(if $(MLRUN_NO_CACHE),--no-cache-dir,)
 
 MLRUN_OLD_VERSION_ESCAPED = $(shell echo "$(MLRUN_OLD_VERSION)" | sed 's/\./\\\./g')
+MLRUN_BC_TESTS_OPENAPI_OUTPUT_PATH ?= $(shell pwd)
 
 .PHONY: help
 help: ## Display available commands
@@ -60,7 +69,7 @@ all:
 
 .PHONY: install-requirements
 install-requirements: ## Install all requirements needed for development
-	python -m pip install --upgrade $(MLRUN_PIP_NO_CACHE_FLAG) pip~=20.2.0
+	python -m pip install --upgrade $(MLRUN_PIP_NO_CACHE_FLAG) pip~=21.2.0
 	python -m pip install \
 		$(MLRUN_PIP_NO_CACHE_FLAG) \
 		-r requirements.txt \
@@ -70,13 +79,13 @@ install-requirements: ## Install all requirements needed for development
 		-r docs/requirements.txt
 
 .PHONY: create-migration-sqlite
-create-migration-sqlite: export MLRUN_HTTPDB__DSN="sqlite:///$(PWD)/mlrun/api/migrations/mlrun.db?check_same_thread=false"
+create-migration-sqlite: export MLRUN_HTTPDB__DSN="sqlite:///$(shell pwd)/mlrun/api/migrations_sqlite/mlrun.db?check_same_thread=false"
 create-migration-sqlite: ## Create a DB migration (MLRUN_MIGRATION_MESSAGE must be set)
 ifndef MLRUN_MIGRATION_MESSAGE
 	$(error MLRUN_MIGRATION_MESSAGE is undefined)
 endif
-	alembic -c ./mlrun/api/alembic_sqlite.ini upgrade head
-	alembic -c ./mlrun/api/alembic_sqlite.ini revision --autogenerate -m "$(MLRUN_MIGRATION_MESSAGE)"
+	alembic -c ./mlrun/api/alembic.ini upgrade head
+	alembic -c ./mlrun/api/alembic.ini revision --autogenerate -m "$(MLRUN_MIGRATION_MESSAGE)"
 
 .PHONY: create-migration-mysql
 create-migration-mysql: export MLRUN_HTTPDB__DSN="mysql+pymysql://root:pass@localhost:3306/mlrun"
@@ -87,13 +96,13 @@ endif
 	docker run \
 		--name=migration-db \
 		--rm \
-		-v $(pwd):/mlrun \
+		-v $(shell pwd):/mlrun \
 		-p 3306:3306 \
 		-e MYSQL_ROOT_PASSWORD="pass" \
 		-e MYSQL_ROOT_HOST=% \
 		-e MYSQL_DATABASE="mlrun" \
 		-d \
-		mysql/mysql-server:5.7 \
+		mysql/mysql-server:8.0 \
 		--character-set-server=utf8 \
 		--collation-server=utf8_bin
 	alembic -c ./mlrun/api/alembic_mysql.ini upgrade head
@@ -114,8 +123,8 @@ endif
 	-type f -print0 | xargs -0 sed -i '' -e 's/:$(MLRUN_OLD_VERSION_ESCAPED)/:$(MLRUN_NEW_VERSION)/g'
 
 .PHONY: update-version-file
-update-version-file: automation ## Update the version file
-	python ./automation/version/version_file.py --mlrun-version $(MLRUN_VERSION)
+update-version-file: ## Update the version file
+	python ./automation/version/version_file.py --mlrun-version $(MLRUN_PYTHON_PACKAGE_VERSION)
 
 .PHONY: build
 build: docker-images package-wheel ## Build all artifacts
@@ -186,7 +195,6 @@ base-core: pull-cache update-version-file ## Build base core docker image
 	docker build \
 		--file dockerfiles/base/Dockerfile \
 		--build-arg MLRUN_PYTHON_VERSION=$(MLRUN_PYTHON_VERSION) \
-		--build-arg MLRUN_MLUTILS_GITHUB_TAG=$(MLRUN_MLUTILS_GITHUB_TAG) \
 		$(MLRUN_DOCKER_CACHE_FROM_FLAG) \
 		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
 		--tag $(MLRUN_CORE_BASE_IMAGE_NAME_TAGGED) .
@@ -219,7 +227,6 @@ base-legacy-core: pull-cache update-version-file ## Build base legacy core docke
 	docker build \
 		--file dockerfiles/base/Dockerfile \
 		--build-arg MLRUN_PYTHON_VERSION=$(MLRUN_LEGACY_ML_PYTHON_VERSION) \
-		--build-arg MLRUN_MLUTILS_GITHUB_TAG=$(MLRUN_MLUTILS_GITHUB_TAG) \
 		$(MLRUN_DOCKER_CACHE_FROM_FLAG) \
 		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
 		--tag $(MLRUN_CORE_LEGACY_BASE_IMAGE_NAME_TAGGED) .
@@ -252,6 +259,8 @@ models-core: base-core ## Build models core docker image
 	docker build \
 		--file dockerfiles/models/Dockerfile \
 		--build-arg MLRUN_BASE_IMAGE=$(MLRUN_CORE_BASE_IMAGE_NAME_TAGGED) \
+		--build-arg TENSORFLOW_VERSION=$(MLRUN_TENSORFLOW_VERSION) \
+		--build-arg HOROVOD_VERSION=$(MLRUN_HOROVOD_VERSION) \
 		$(MLRUN_DOCKER_CACHE_FROM_FLAG) \
 		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
 		--tag $(MLRUN_CORE_MODELS_IMAGE_NAME_TAGGED) .
@@ -262,8 +271,6 @@ models: models-core ## Build models docker image
 	docker build \
 		--file dockerfiles/common/Dockerfile \
 		--build-arg MLRUN_BASE_IMAGE=$(MLRUN_CORE_MODELS_IMAGE_NAME_TAGGED) \
-		--build-arg TENSORFLOW_VERSION=$(MLRUN_TENSORFLOW_VERSION) \
-		--build-arg HOROVOD_VERSION=$(MLRUN_HOROVOD_VERSION) \
 		$(MLRUN_DOCKER_CACHE_FROM_FLAG) \
 		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
 		--tag $(MLRUN_MODELS_IMAGE_NAME_TAGGED) .
@@ -320,7 +327,6 @@ models-gpu: update-version-file ## Build models-gpu docker image
 	$(MLRUN_MODELS_GPU_CACHE_IMAGE_PULL_COMMAND)
 	docker build \
 		--file dockerfiles/models-gpu/Dockerfile \
-		--build-arg MLRUN_MLUTILS_GITHUB_TAG=$(MLRUN_MLUTILS_GITHUB_TAG) \
 		--build-arg CUDA_VER=$(MLRUN_CUDA_VERSION) \
 		--build-arg TENSORFLOW_VERSION=$(MLRUN_TENSORFLOW_VERSION) \
 		--build-arg HOROVOD_VERSION=$(MLRUN_HOROVOD_VERSION) \
@@ -347,7 +353,6 @@ models-gpu-legacy: update-version-file ## Build models-gpu legacy docker image
 	$(MLRUN_LEGACY_MODELS_GPU_CACHE_IMAGE_PULL_COMMAND)
 	docker build \
 		--file dockerfiles/models-gpu/$(MLRUN_LEGACY_DOCKERFILE_DIR_NAME)/Dockerfile \
-		--build-arg MLRUN_MLUTILS_GITHUB_TAG=$(MLRUN_MLUTILS_GITHUB_TAG) \
 		$(MLRUN_LEGACY_MODELS_GPU_IMAGE_DOCKER_CACHE_FROM_FLAG) \
 		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
 		--tag $(MLRUN_LEGACY_MODELS_GPU_IMAGE_NAME_TAGGED) .
@@ -551,7 +556,25 @@ run-api: api ## Run mlrun api (dockerized)
 		--name mlrun-api \
 		--detach \
 		--publish 8080 \
+		--add-host host.docker.internal:host-gateway \
+		--env MLRUN_HTTPDB__DSN=$(MLRUN_HTTPDB__DSN) \
 		$(MLRUN_API_IMAGE_NAME_TAGGED)
+
+.PHONY: run-test-db
+run-test-db:
+	docker run \
+		--name=test-db \
+		-v $(shell pwd):/mlrun \
+		-p 3306:3306 \
+		-e MYSQL_ROOT_PASSWORD="" \
+		-e MYSQL_ALLOW_EMPTY_PASSWORD="true" \
+		-e MYSQL_ROOT_HOST=% \
+		-e MYSQL_DATABASE="mlrun" \
+		-d \
+		mysql/mysql-server:8.0 \
+		--character-set-server=utf8 \
+		--collation-server=utf8_bin \
+		--sql_mode=""
 
 .PHONY: html-docs
 html-docs: ## Build html docs
@@ -562,7 +585,7 @@ html-docs: ## Build html docs
 html-docs-dockerized: build-test ## Build html docs dockerized
 	docker run \
 		--rm \
-		-v $(PWD)/docs/_build:/mlrun/docs/_build \
+		-v $(shell pwd)/docs/_build:/mlrun/docs/_build \
 		$(MLRUN_TEST_IMAGE_NAME_TAGGED) \
 		make html-docs
 
@@ -610,6 +633,38 @@ endif
 	fi; \
 	git commit -m "Adding $(MLRUN_VERSION) tag contents" --allow-empty; \
 	git push origin $$BRANCH_NAME
+
+.PHONY: test-backward-compatibility-dockerized
+test-backward-compatibility-dockerized: build-test ## Run backward compatibility tests in docker container
+ifndef MLRUN_BC_TESTS_BASE_CODE_PATH
+	$(error MLRUN_BC_TESTS_BASE_CODE_PATH is undefined)
+endif
+	docker run \
+	    -t \
+	    --rm \
+	    --network='host' \
+	    -v /tmp:/tmp \
+	    -v $(shell pwd):$(shell pwd) \
+	    -v $(MLRUN_BC_TESTS_BASE_CODE_PATH):$(MLRUN_BC_TESTS_BASE_CODE_PATH) \
+	    -v /var/run/docker.sock:/var/run/docker.sock \
+	    --env MLRUN_BC_TESTS_BASE_CODE_PATH=$(MLRUN_BC_TESTS_BASE_CODE_PATH) \
+	    --env MLRUN_BC_TESTS_OPENAPI_OUTPUT_PATH=$(shell pwd) \
+	    --workdir=$(shell pwd) \
+	    $(MLRUN_TEST_IMAGE_NAME_TAGGED) make test-backward-compatibility
+
+.PHONY: test-backward-compatibility
+test-backward-compatibility: ## Run backward compatibility tests
+ifndef MLRUN_BC_TESTS_BASE_CODE_PATH
+	$(error MLRUN_BC_TESTS_BASE_CODE_PATH is undefined)
+endif
+ifndef MLRUN_BC_TESTS_OPENAPI_OUTPUT_PATH
+	$(error MLRUN_BC_TESTS_OPENAPI_OUTPUT_PATH is undefined)
+endif
+	export MLRUN_OPENAPI_JSON_NAME=mlrun_bc_base_oai.json && \
+	python -m pytest -v --capture=no --disable-warnings --durations=100 $(MLRUN_BC_TESTS_BASE_CODE_PATH)/tests/api/api/test_docs.py::test_save_openapi_json && \
+	export MLRUN_OPENAPI_JSON_NAME=mlrun_bc_head_oai.json && \
+	python -m pytest -v --capture=no --disable-warnings --durations=100 tests/api/api/test_docs.py::test_save_openapi_json && \
+	docker run --rm -t -v $(MLRUN_BC_TESTS_OPENAPI_OUTPUT_PATH):/specs:ro openapitools/openapi-diff:2.0.1 /specs/mlrun_bc_base_oai.json /specs/mlrun_bc_head_oai.json --fail-on-incompatible
 
 
 .PHONY: release-notes

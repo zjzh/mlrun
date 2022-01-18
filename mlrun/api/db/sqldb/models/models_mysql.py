@@ -18,8 +18,8 @@ import warnings
 from datetime import datetime, timezone
 
 import orjson
+import sqlalchemy.dialects.mysql
 from sqlalchemy import (
-    BLOB,
     JSON,
     TIMESTAMP,
     Column,
@@ -117,10 +117,7 @@ def make_tag_v2(table):
         project = Column(String(255, collation=SQLCollationUtil.collation()))
         name = Column(String(255, collation=SQLCollationUtil.collation()))
         obj_id = Column(Integer, ForeignKey(f"{table}.id"))
-        obj_name = Column(
-            String(255, collation=SQLCollationUtil.collation()),
-            ForeignKey(f"{table}.name"),
-        )
+        obj_name = Column(String(255, collation=SQLCollationUtil.collation()))
 
     return Tag
 
@@ -144,8 +141,10 @@ with warnings.catch_warnings():
         uid = Column(String(255, collation=SQLCollationUtil.collation()))
         updated = Column(TIMESTAMP)
         # TODO: change to JSON, see mlrun/api/schemas/function.py::FunctionState for reasoning
-        body = Column(BLOB)
-        labels = relationship(Label)
+        body = Column(sqlalchemy.dialects.mysql.MEDIUMBLOB)
+
+        labels = relationship(Label, cascade="all, delete-orphan")
+        tags = relationship(Tag, cascade="all, delete-orphan")
 
         def get_identifier_string(self) -> str:
             return f"{self.project}/{self.key}/{self.uid}"
@@ -164,9 +163,11 @@ with warnings.catch_warnings():
         project = Column(String(255, collation=SQLCollationUtil.collation()))
         uid = Column(String(255, collation=SQLCollationUtil.collation()))
         # TODO: change to JSON, see mlrun/api/schemas/function.py::FunctionState for reasoning
-        body = Column(BLOB)
+        body = Column(sqlalchemy.dialects.mysql.MEDIUMBLOB)
         updated = Column(TIMESTAMP)
-        labels = relationship(Label)
+
+        labels = relationship(Label, cascade="all, delete-orphan")
+        tags = relationship(Tag, cascade="all, delete-orphan")
 
         def get_identifier_string(self) -> str:
             return f"{self.project}/{self.name}/{self.uid}"
@@ -178,7 +179,7 @@ with warnings.catch_warnings():
         uid = Column(String(255, collation=SQLCollationUtil.collation()))
         project = Column(String(255, collation=SQLCollationUtil.collation()))
         # TODO: change to JSON, see mlrun/api/schemas/function.py::FunctionState for reasoning
-        body = Column(BLOB)
+        body = Column(sqlalchemy.dialects.mysql.MEDIUMBLOB)
 
         def get_identifier_string(self) -> str:
             return f"{self.project}/{self.uid}"
@@ -195,12 +196,18 @@ with warnings.catch_warnings():
         id = Column(Integer, primary_key=True)
         uid = Column(String(255, collation=SQLCollationUtil.collation()))
         project = Column(String(255, collation=SQLCollationUtil.collation()))
+        name = Column(
+            String(255, collation=SQLCollationUtil.collation()), default="no-name"
+        )
         iteration = Column(Integer)
         state = Column(String(255, collation=SQLCollationUtil.collation()))
         # TODO: change to JSON, see mlrun/api/schemas/function.py::FunctionState for reasoning
-        body = Column(BLOB)
+        body = Column(sqlalchemy.dialects.mysql.MEDIUMBLOB)
         start_time = Column(TIMESTAMP)
-        labels = relationship(Label)
+        updated = Column(TIMESTAMP, default=datetime.utcnow)
+
+        labels = relationship(Label, cascade="all, delete-orphan")
+        tags = relationship(Tag, cascade="all, delete-orphan")
 
         def get_identifier_string(self) -> str:
             return f"{self.project}/{self.uid}/{self.iteration}"
@@ -225,7 +232,7 @@ with warnings.catch_warnings():
         cron_trigger_str = Column(String(255, collation=SQLCollationUtil.collation()))
         last_run_uri = Column(String(255, collation=SQLCollationUtil.collation()))
         # TODO: change to JSON, see mlrun/api/schemas/function.py::FunctionState for reasoning
-        struct = Column(BLOB)
+        struct = Column(sqlalchemy.dialects.mysql.MEDIUMBLOB)
         labels = relationship(Label, cascade="all, delete-orphan")
         concurrency_limit = Column(Integer, nullable=False)
 
@@ -276,7 +283,7 @@ with warnings.catch_warnings():
         # the attribute name used to be _spec which is just a wrong naming, the attribute was renamed to _full_object
         # leaving the column as is to prevent redundant migration
         # TODO: change to JSON, see mlrun/api/schemas/function.py::FunctionState for reasoning
-        _full_object = Column("spec", BLOB)
+        _full_object = Column("spec", sqlalchemy.dialects.mysql.MEDIUMBLOB)
         created = Column(TIMESTAMP, default=datetime.utcnow)
         state = Column(String(255, collation=SQLCollationUtil.collation()))
         users = relationship(User, secondary=project_users)
@@ -345,6 +352,7 @@ with warnings.catch_warnings():
         Tag = make_tag_v2(__tablename__)
 
         labels = relationship(Label, cascade="all, delete-orphan")
+        tags = relationship(Tag, cascade="all, delete-orphan")
 
         features = relationship(Feature, cascade="all, delete-orphan")
         entities = relationship(Entity, cascade="all, delete-orphan")
@@ -381,6 +389,7 @@ with warnings.catch_warnings():
         Tag = make_tag_v2(__tablename__)
 
         labels = relationship(Label, cascade="all, delete-orphan")
+        tags = relationship(Tag, cascade="all, delete-orphan")
 
         def get_identifier_string(self) -> str:
             return f"{self.project}/{self.name}/{self.uid}"
@@ -417,6 +426,14 @@ with warnings.catch_warnings():
         @full_object.setter
         def full_object(self, value):
             self._full_object = json.dumps(value)
+
+    class DataVersion(Base, BaseModel):
+        __tablename__ = "data_versions"
+        __table_args__ = (UniqueConstraint("version", name="_versions_uc"),)
+
+        id = Column(Integer, primary_key=True)
+        version = Column(String(255, collation=SQLCollationUtil.collation()))
+        created = Column(TIMESTAMP, default=datetime.now(timezone.utc))
 
 
 # Must be after all table definitions
